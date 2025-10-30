@@ -84,13 +84,16 @@ const clicked = await $page.evaluate(() => {
 // Wait for the next page to load (adjust selector accordingly)
 await $page.waitForSelector('#firstName0', { timeout: 60000 });
 
+const firstName = '{{ $json.body.step_4_driver_first_name_1 }}';
+const lastName = '{{ $json.body.step_4_driver_last_name_1 }}';
+
 // Fill out the form on the next page
-await $page.type('#firstName0', '{{ $json.body.zoho_r_data.first_name }}', { delay: 30 });  
-await $page.type('#lastName0', '{{ $json.body.zoho_r_data.last_name }}', { delay: 30 });
-await $page.type('#licenseNumber0', licenseNo, { delay: 30 }); 
+await $page.type('#firstName0', firstName, { delay: 30 });  
+await $page.type('#lastName0', lastName, { delay: 30 });
+await $page.type('#licenseNumber0', '{{ $json.body.step_4_driver_license_number_1 }}' , { delay: 30 });  
 
 
-const dateStr = '{{ $json.body.zoho_r_data.date_of_birth }}';
+const dateStr = '{{ $json.body.step_4_driver_date_of_birth_1 }}';
 
 // Convert to MMDDYYYY
 function formatDateToMMDDYYYY(dateStr) {
@@ -106,13 +109,7 @@ const dobFormatted = formatDateToMMDDYYYY(dateStr);
 await $page.click('input.datepicker-input__input', { clickCount: 3 });
 await $page.keyboard.type(dobFormatted, { delay: 150 });
 await $page.keyboard.press('Tab');
-// Take a screenshot after the page has loaded 
-const screenshotPath = 'C:/InsuranceQuote/screenshot.png'; 
-await $page.screenshot({ path: screenshotPath, fullPage: true });
 
-return [{
-json: { message: 'PDF captured successfully', licenseNo: licenseNo },
-}];
 // Click the RMV Lookup button
 await $page.click('button[type="submit"].o-btn');
 
@@ -222,6 +219,14 @@ await $page.keyboard.type('Insured', { delay: 100 });
 // Simulate Tab key press to move to the next field
 await $page.keyboard.press('Tab');
 
+const firstLicenseNo = '{{ $json.body.step_3_data.date_of_first_licensed }}';
+
+if(firstLicenseNo){
+  const firstLicenseFormatted = formatDateToMMDDYYYY(firstLicenseNo);
+  await $page.type('#driverFirstLicensed', firstLicenseFormatted, { delay: 100 });
+  await $page.keyboard.press('Tab');
+}
+
 // Optionally, wait for a moment to ensure the tab is processed
 await new Promise(r => setTimeout(r, 500));
 
@@ -230,8 +235,8 @@ await $page.click('.tabs__list .tabs__item a[href*="vehicles"]');
 
 await new Promise(r => setTimeout(r, 1000));
 
- const vehicleVin = '{{ $json.body.zoho_r_data.vehicle_identification_number }}'
-
+const vehicleVin = '{{ $json.body.step_5_vehicle_identification_number_1 }}';
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 // Only execute Puppeteer actions if VIN exists and is not empty
 if (vehicleVin && vehicleVin.trim() !== '')
 {
@@ -248,7 +253,7 @@ if (vehicleVin && vehicleVin.trim() !== '')
     await new Promise(r => setTimeout(r, 500));
 }
 else{
-    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    
 
     async function openSelectLike($page, inputSel) {
     await $page.waitForSelector(inputSel, { timeout: 30000 });
@@ -379,9 +384,12 @@ else{
     // ----------------- USAGE -----------------
 
     // Always do Year -> Make -> Model in order
-    await fillSelectLike($page, '#vehicleYear', '{{ $json.body.step_5_vehicle_year_1 }}');
-    await fillSelectLike($page, '#vehicleMake', '{{ $json.body.step_5_vehicle_make_1 }}');
-    const picked = await fillSelectLike($page, '#vehicleModel', '{{ $json.body.step_5_vehicle_model_1 }}');
+    // await fillSelectLike($page, '#vehicleYear', '{{ $json.body.step_5_vehicle_year_1 }}');
+    // await fillSelectLike($page, '#vehicleMake', '{{ $json.body.step_5_vehicle_make_1 }}');
+    // const picked = await fillSelectLike($page, '#vehicleModel', '{{ $json.body.step_5_vehicle_model_1 }}');
+    await fillSelectLike($page, '#vehicleYear', '2016');
+    await fillSelectLike($page, '#vehicleMake', 'Subaru');
+    const picked = await fillSelectLike($page, '#vehicleModel', 'OUTBACK');
 
     if (!picked) {
     // Debug snapshot around the model field to see what’s actually rendered
@@ -407,7 +415,7 @@ else{
     return ok;
     }
 
-    const trimValue = ''; // <-- set your target trim label here
+    const trimValue = '{{ $json.body.step_5_reg_type_1 }}'; // <-- set your target trim label here
     const trimPicked = await fillTrim(trimValue);
 
     // Optional debug if still not picked
@@ -425,17 +433,18 @@ else{
 }
 
 
+ 
 // Wait for and fill the 'vehicleLocationAddress1' input
 await $page.waitForSelector('#vehicleLocationAddress1', { timeout: 10000 });
 await $page.click('#vehicleLocationAddress1', { clickCount: 3 });
 await $page.keyboard.press('Backspace');
-await $page.keyboard.type('245 1st st', { delay: 100 });
+await $page.keyboard.type('{{ $json.body.step_1_data.address1 }}', { delay: 100 });
 
 // Wait for and fill the 'vehicleLocationCity' input
 await $page.waitForSelector('#vehicleLocationCity', { timeout: 10000 });
 await $page.click('#vehicleLocationCity', { clickCount: 3 });
 await $page.keyboard.press('Backspace');
-await $page.keyboard.type('Cambridge', { delay: 100 });
+await $page.keyboard.type('{{ $json.body.step_1_data.city }}', { delay: 100 });
 
 // Wait for and fill the 'vehicleLocationZip' input
 await $page.waitForSelector('#vehicleLocationZip', { timeout: 10000 });
@@ -445,13 +454,13 @@ await $page.click('#vehicleLocationZip', { clickCount: 3 });
 await $page.keyboard.press('Backspace');
 
 // Type the valid ZIP code '02142'
-await $page.keyboard.type('02142', { delay: 100 });
+await $page.keyboard.type('{{ $json.body.step_1_data.zip }}', { delay: 100 });
 
 // Ensure the value is accepted by dispatching events manually (to trigger pattern validation)
 await $page.evaluate(() => {
   const input = document.querySelector('#vehicleLocationZip');
   if (input) {
-    input.value = '02142'; 
+    input.value = '{{ $json.body.step_1_data.zip }}'; 
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true })); 
   }
@@ -465,7 +474,7 @@ await $page.keyboard.type('10000', { delay: 100 });
 await $page.keyboard.press('Tab');
 await new Promise((resolve) => setTimeout(resolve, 1000));
 
-
+ 
 
 // Click the "Options" tab (using partial href match)
 await $page.click('.tabs__list .tabs__item a[href*="options"]');
@@ -504,10 +513,82 @@ if (optionDobFormatted) {
 }
 
 //3. Fill the 'priorOrRenewingCarrier' input await $page.waitForSelector('#priorOrRenewingCarrier', { timeout: 10000 });
-await $page.click('#yearsWithThisCarrier', { clickCount: 3 });
+
+const YEARS_ID = '#yearsWithThisCarrier';
+
+// 1) Wait until it exists and is visible
+await $page.waitForSelector(YEARS_ID, { timeout: 15000 });
+await $page.$eval(YEARS_ID, el => el.scrollIntoView({ block: 'center' }));
+
+// 2) Try real typing first (many inputs require key events)
+await $page.focus(YEARS_ID);
+await $page.keyboard.down('Control').catch(()=>{});
+await $page.keyboard.press('KeyA').catch(()=>{});  // Ctrl+A
+await $page.keyboard.up('Control').catch(()=>{});
 await $page.keyboard.press('Backspace');
-await $page.keyboard.type('6', { delay: 100 });
+await $page.keyboard.type('6', { delay: 80 });
 await $page.keyboard.press('Tab');
+await new Promise(r => setTimeout(r, 300));
+
+// Check if value stuck
+let yearsVal = await $page.$eval(YEARS_ID, el => el.value || el.getAttribute('value') || '');
+if (yearsVal !== '6') {
+  // 3) Open the autocomplete dropdown and click the option "6"
+  const opened = await $page.evaluate((sel) => {
+    const input = document.querySelector(sel);
+    if (!input) return false;
+    const root = input.closest('.autocomplete') || input.parentElement;
+    const toggle = root && root.querySelector('.autocomplete__btn-toggle');
+    if (toggle) { toggle.click(); return true; }
+    // Some builds open on input click
+    input.click();
+    return true;
+  }, YEARS_ID);
+
+  if (opened) {
+    // wait for listbox to render (cover common variants)
+    await $page.waitForSelector('.autocomplete__list, [role="listbox"], .cdk-overlay-container', { timeout: 5000 }).catch(()=>{});
+
+    // click an option that is exactly "6" or starts with "6"
+    const picked = await $page.evaluate(() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const candidates = [
+        ...document.querySelectorAll('.autocomplete__list *'),
+        ...document.querySelectorAll('[role="listbox"] *'),
+        ...document.querySelectorAll('.cdk-overlay-container [role="option"], .cdk-overlay-container *')
+      ];
+      const target = candidates.find(el => /^6\b/.test(norm(el.textContent)));
+      if (target) { target.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); target.click(); return true; }
+      return false;
+    });
+
+    await new Promise(r => setTimeout(r, 250));
+    yearsVal = await $page.$eval(YEARS_ID, el => el.value || el.getAttribute('value') || '');
+    if (!picked || yearsVal !== '6') {
+      // 4) Fallback: set hidden backing input + fire events
+      await $page.evaluate((sel) => {
+        const input = document.querySelector(sel);
+        if (!input) return;
+        const hidden = document.querySelector(`${sel}_value`) || input; // many components use *_value
+        hidden.value = '6';
+        hidden.dispatchEvent(new Event('input', { bubbles: true }));
+        hidden.dispatchEvent(new Event('change', { bubbles: true }));
+        input.value = '6';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new Event('blur',   { bubbles: true }));
+      }, YEARS_ID);
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+}
+
+// Final blur to seal it
+await $page.keyboard.press('Tab').catch(()=>{});
+await new Promise(r => setTimeout(r, 150));
+
+
+
 
 // 2. Fill the 'yearsWithCurrentAgency' input field with "0"
 await $page.waitForSelector('#yearsWithCurrentAgency', { timeout: 10000 });
@@ -530,63 +611,62 @@ await $page.keyboard.press('Tab');
 
 await new Promise((resolve) => setTimeout(resolve, 1000));
 
-
 // MAPFRE "Length of Time for Continuous Coverage" — click the icon to check
 const BASE_ID   = 'BSC-AUTO-002400_MAPFRELengthofTimeforContinuousCoverage';
 const SEL_ITEM  = `#${BASE_ID}`;
 const SEL_INPUT = `#${BASE_ID}_checkbox`;
 const SEL_ICON  = `#${BASE_ID}_checkbox + i.o-btn.o-btn--checkbox`;
 
-await $page.waitForSelector(SEL_ITEM,  { timeout: 15000 });
-await $page.$eval(SEL_ITEM, el => el.scrollIntoView({ block: 'center', inline: 'center' }));
+// Scroll into view and check if the checkbox is already checked
+await $page.$eval(SEL_ITEM, el => el.scrollIntoView({ block: 'center', inline: 'center' })).catch(()=>{});
 
-// Try clicking the styled <i> icon (preferred)
-let toggledIcon = false;
-try {
-  await $page.waitForSelector(SEL_ICON, { timeout: 2000 });
-  await $page.click(SEL_ICON, { delay: 20 });
-  toggledIcon = true;
-} catch (_) {}
+// Check if the checkbox is already checked
+let checked = await $page.$eval(SEL_INPUT, el => !!el.checked).catch(()=>false);
 
-// Fallback: click the label wrapper
-if (!toggledIcon) {
-  await $page.click(`${SEL_ITEM} label.o-checkable`).catch(() => {});
-}
+if (checked) {
+  console.log('Checkbox is already checked, skipping...');
+} else {
+  // If not checked, try clicking the icon, label, or force-check
+  try {
+    await $page.waitForSelector(SEL_ICON, { timeout: 2000 });
+    await $page.click(SEL_ICON, { delay: 20 });
+    await sleep(150);
+    checked = await $page.$eval(SEL_INPUT, el => !!el.checked).catch(()=>false);
+  } catch(_) {}
 
-// Give the UI a beat, then check state
-await new Promise(r => setTimeout(r, 150));
-let isChecked = await $page.$eval(SEL_INPUT, el => !!el.checked).catch(() => false);
+  if (!checked) {
+    await $page.click(`${SEL_ITEM} label.o-checkable`).catch(()=>{});
+    await sleep(150);
+    checked = await $page.$eval(SEL_INPUT, el => !!el.checked).catch(()=>false);
+  }
 
-// Last resort: force-check and fire events so Angular updates bindings
-if (!isChecked) {
-  await $page.evaluate((sel) => {
-    const el = document.querySelector(sel);
-    if (!el) return;
-    // click once more (some UIs bind on click)
-    try { el.click(); } catch (e) {}
-    if (!el.checked) el.checked = true;
-    el.dispatchEvent(new Event('input',  { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new Event('blur',   { bubbles: true }));
-  }, SEL_INPUT);
+  if (!checked) {
+    await $page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return;
+      try { el.click(); } catch(e){}
+      if (!el.checked) el.checked = true;
+      el.dispatchEvent(new Event('input',  { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur',   { bubbles: true }));
+    }, SEL_INPUT);
+    await sleep(120);
+    checked = await $page.$eval(SEL_INPUT, el => !!el.checked).catch(()=>false);
+  }
 
-  await new Promise(r => setTimeout(r, 100));
-  isChecked = await $page.$eval(SEL_INPUT, el => !!el.checked).catch(() => false);
-}
-
-// Optional coordinate click if still not toggled (rare overlays)
-if (!isChecked) {
-  const handle = await $page.$(SEL_ICON) || await $page.$(`${SEL_ITEM} label.o-checkable`);
-  if (handle) {
-    const box = await handle.boundingBox();
-    if (box) {
-      await $page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-      await new Promise(r => setTimeout(r, 100));
-      isChecked = await $page.$eval(SEL_INPUT, el => !!el.checked).catch(() => false);
+  if (!checked) {
+    // coordinate click as last resort
+    const h = await $page.$(SEL_ICON) || await $page.$(`${SEL_ITEM} label.o-checkable`);
+    if (h) {
+      const box = await h.boundingBox();
+      if (box) {
+        await $page.mouse.click(box.x + box.width/2, box.y + box.height/2);
+        await sleep(150);
+        checked = await $page.$eval(SEL_INPUT, el => !!el.checked).catch(()=>false);
+      }
     }
   }
 }
-
 
 // --- Select "36+ months" in the MAPFRE modal (simple & robust) ---
 await $page.waitForSelector('label.o-checkable input[name="parsedItemOption"]', { timeout: 15000 });
@@ -674,6 +754,7 @@ await $page.waitForFunction(
   () => !document.querySelector('.modalbox__content, .box--silver, [role="dialog"]'),
   { timeout: 10000 }
 ).catch(() => console.log('Modal did not close within 10s (continuing)'));
+
 
 
 // --- Travelers "Continuous Insurance" — click the checkbox to open modal ---
@@ -968,6 +1049,7 @@ await $page.waitForFunction(
 
 
 
+
 await $page.click('.tabs__list .tabs__item a[href*="premiums"]');
 
 // --- Click the "Rate" button for the MAIP (CAR) row ---
@@ -978,6 +1060,8 @@ await $page.waitForSelector('button.app-button.app-button--save-quote', { visibl
 await $page.$eval('button.app-button.app-button--save-quote', el => el.scrollIntoView({ block: 'center' }));
 await $page.click('button.app-button.app-button--save-quote', { delay: 50 });
 await new Promise(r => setTimeout(r, 2000));
+
+
 
 /// --- Ensure DOM is ready and button visible ---
 await $page.waitForFunction(() => {
@@ -1007,7 +1091,6 @@ if (!rateAllClicked) {
 } // adjust as needed
 
 await new Promise(r => setTimeout(r, 60000));
-
 
 const clickedRate = await $page.evaluate(() => {
   // Find all rows in the premium table
@@ -1203,8 +1286,18 @@ if (!allBufs.length) {
 allBufs.sort((a,b) => b.length - a.length);
 const best = allBufs[0];
 
+const now = new Date();
+const fileFormattedDate = [
+  String(now.getMonth() + 1).padStart(2, '0'),
+  String(now.getDate()).padStart(2, '0'),
+  now.getFullYear()
+].join('');
+
+// 2️⃣ Construct filename like "10282025 Duke Rateau auto insurance quote.pdf"
+const fileName = `${fileFormattedDate} ${firstName} ${lastName} auto insurance quote.pdf`;
+
 return [{
-  json: { message: 'PDF captured successfully', size: best.length, licenseNo: licenseNo },
+  json: { message: 'PDF captured successfully', email: '{{ $json.body.zoho_r_data.email }}' , licenseNo: licenseNo },
   binary: {
     proposal: {
       data: best.toString('base64'),
