@@ -10,6 +10,7 @@ const type = $json.type || 'auto';
 
 // Get the license number from the incoming JSON
 const licenseNo = '{{ $json.body.zoho_r_data.license_number }}' || 'SA5761048';
+// const licenseNo = 'AA5761048';
 
 // Ensure credentials are present
 if (!username || !password) {
@@ -2169,7 +2170,259 @@ else {
     { timeout: 10000 }
   ).catch(() => console.log('Travelers Residence modal did not close within 10s (continuing)'));
 
+await $page.click('.tabs__list .tabs__item a[href*="premiums"]');
 
+  // --- Click the "Rate" button for the MAIP (CAR) row ---
+  await $page.waitForSelector('table.table tbody tr', { timeout: 15000 });
+
+
+  await $page.waitForSelector('button.app-button.app-button--save-quote', { visible: true, timeout: 10000 });
+  await $page.$eval('button.app-button.app-button--save-quote', el => el.scrollIntoView({ block: 'center' }));
+  await $page.click('button.app-button.app-button--save-quote', { delay: 50 });
+  await new Promise(r => setTimeout(r, 2000));
+
+
+
+  /// --- Ensure DOM is ready and button visible ---
+  await $page.waitForFunction(() => {
+    const btns = Array.from(document.querySelectorAll('a.o-btn'));
+    return btns.some(b => (b.textContent || '').trim().toLowerCase() === 'rate all plans' && b.offsetParent !== null);
+  }, { timeout: 15000 });
+
+  // --- Click the correct "Rate All Plans" button safely ---
+  const rateAllClicked = await $page.evaluate(() => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const links = Array.from(document.querySelectorAll('a.o-btn'));
+    const target = links.find(a => norm(a.textContent) === 'rate all plans' && a.offsetParent !== null);
+    if (!target) return false;
+
+    target.scrollIntoView({ block: 'center' });
+    // simulate full user click sequence for Angular binding
+    const evOpts = { bubbles: true, cancelable: true };
+    target.dispatchEvent(new MouseEvent('mouseover', evOpts));
+    target.dispatchEvent(new MouseEvent('mousedown', evOpts));
+    target.dispatchEvent(new MouseEvent('mouseup', evOpts));
+    target.dispatchEvent(new MouseEvent('click', evOpts));
+    return true;
+  });
+
+  if (!rateAllClicked) {
+    throw new Error('Could not find or trigger the "Rate All Plans" button.');
+  } // adjust as needed
+
+  await new Promise(r => setTimeout(r, 60000));
+
+  const clickedRate = await $page.evaluate(() => {
+    // Find all rows in the premium table
+    const rows = Array.from(document.querySelectorAll('table.table tbody tr'));
+    for (const row of rows) {
+      const text = (row.innerText || '').trim();
+      if (/MAIP\s*\(CAR\)/i.test(text)) {
+        // Inside that row, find a Rate button
+        const btn = row.querySelector('button.o-btn, button');
+        if (btn && /rate/i.test((btn.textContent || '').trim())) {
+          btn.scrollIntoView({ block: 'center' });
+          btn.click();
+          return true;
+        }
+      }
+    }
+    return false;
+  });
+
+  // Optional: wait for next page or processing
+  await new Promise(r => setTimeout(r, 60000));
+  // --- Click the "View plan summary" button for MAIP (CAR) ---
+  await $page.waitForSelector('table.table tbody tr', { timeout: 15000 });
+
+  const viewClicked = await $page.evaluate(() => {
+    // find all rows in the table
+    const rows = Array.from(document.querySelectorAll('table.table tbody tr'));
+    for (const row of rows) {
+      const text = (row.innerText || '').trim();
+      // look for the row containing MAIP (CAR)
+      if (/MAIP\s*\(CAR\)/i.test(text)) {
+        // find the "View plan summary" button in that row
+        const btn = row.querySelector('button.o-btn.o-btn--outlined.o-btn--i_search-plus');
+        if (btn && /view\s*plan\s*summary/i.test((btn.textContent || '').trim())) {
+          btn.scrollIntoView({ block: 'center' });
+          btn.click();
+          return true;
+        }
+      }
+    }
+    return false;
+  });
+
+  // Optional: wait for modal or next page to appear
+  await new Promise(r => setTimeout(r, 30000));
+
+  const BLOB_HOOK = () => {
+    (function () {
+      const origCreate = URL.createObjectURL.bind(URL);
+
+      // Per-document queue for captured PDF byte arrays (as plain number[])
+      Object.defineProperty(window, '__pdfQueues__', {
+        value: [],
+        writable: false, configurable: false, enumerable: false
+      });
+
+      function pushPdfBytes(u8) {
+        try { window.__pdfQueues__.push(Array.from(u8)); } catch (_) { }
+      }
+
+      URL.createObjectURL = function (blob) {
+        try {
+          if (blob && typeof blob.type === 'string' && /pdf/i.test(blob.type)) {
+            const r = new FileReader();
+            r.onload = () => {
+              try { pushPdfBytes(new Uint8Array(r.result)); } catch (_) { }
+            };
+            r.readAsArrayBuffer(blob);
+          }
+        } catch (_) { }
+        return origCreate(blob);
+      };
+    })();
+  };
+
+  // 1) Install hook on the CURRENT page for any same-tab blob document loads
+  if ($page.evaluateOnNewDocument) {
+    await $page.evaluateOnNewDocument(BLOB_HOOK);
+  } else {
+    // Fallback: inject immediately (will still catch many SPA flows)
+    await $page.evaluate(BLOB_HOOK).catch(() => { });
+  }
+
+  // 2) Prepare to hook the POPUP as soon as it's created (before it navigates)
+  const popupPromise = new Promise(resolve => {
+    $page.once('popup', async (p) => {
+      try {
+        if (p.evaluateOnNewDocument) {
+          await p.evaluateOnNewDocument(BLOB_HOOK);
+        } else {
+          // fallback if method missing
+          await p.evaluate(BLOB_HOOK).catch(() => { });
+        }
+      } catch (_) { }
+      resolve(p);
+    });
+  });
+
+  // 3) Open the menu and click the print option
+  await $page.waitForSelector('#tooltipLauncherPrint', { timeout: 10000 });
+  await $page.$eval('#tooltipLauncherPrint', el => { el.scrollIntoView({ block: 'center' }); el.click(); });
+  await $page.waitForSelector('.tooltip__menu', { timeout: 10000 });
+
+  const clickedProposal = await $page.evaluate(() => {
+    const links = Array.from(document.querySelectorAll('.tooltip__menu a.tooltip__menu-link'));
+    const t = links.find(a => /Print\s*Long\s*Proposal/i.test((a.innerText || a.textContent || '').trim()));
+    if (!t) return false;
+    t.scrollIntoView({ block: 'center' });
+    t.click(); // opens blob: in popup or same tab
+    return true;
+  });
+  if (!clickedProposal) throw new Error('Could not find "Print Long Proposal" in the dropdown.');
+
+  // 4) Wait to see if a popup appears; otherwise assume same-tab
+  let newTab = null;
+  try {
+    newTab = await Promise.race([
+      popupPromise,
+      (async () => { await sleep(1500); return null; })()
+    ]);
+  } catch (_) { }
+
+  // 5) Allow time for blob creation & viewer init
+  if (newTab) {
+    await newTab.bringToFront().catch(() => { });
+    await Promise.race([
+      newTab.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => { }),
+      newTab.waitForSelector('body', { timeout: 15000 }).catch(() => { }),
+      sleep(2000)
+    ]);
+  } else {
+    await Promise.race([
+      $page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => { }),
+      sleep(2000)
+    ]);
+  }
+
+  // 6) Read captured bytes from both contexts
+  async function pullFrom(page) {
+    try {
+      const arrays = await page.evaluate(() => (Array.isArray(window.__pdfQueues__) ? window.__pdfQueues__ : []));
+      if (!arrays || !arrays.length) return [];
+      return arrays.map(a => Buffer.from(Uint8Array.from(a)));
+    } catch (_) { return []; }
+  }
+  const mainBufs = await pullFrom($page);
+  const popupBufs = newTab ? await pullFrom(newTab) : [];
+  const allBufs = mainBufs.concat(popupBufs).filter(b => b && b.length);
+
+  if (!allBufs.length) {
+    // Optional: last-chance network sniff with magic-byte check (covers octet-stream)
+    function armPdfCatcher(page) {
+      return new Promise(resolve => {
+        const pdfs = [];
+        const handler = async (resp) => {
+          try {
+            const headers = resp.headers() || {};
+            const ct = (headers['content-type'] || headers['Content-Type'] || '').toLowerCase();
+            const cd = (headers['content-disposition'] || headers['Content-Disposition'] || '').toLowerCase();
+            const buf = await (resp.buffer ? resp.buffer() : Buffer.from(await resp.arrayBuffer()));
+            if (!buf || !buf.length) return;
+            const looksPdf = ct.includes('application/pdf') ||
+              cd.includes('.pdf') ||
+              buf.slice(0, 5).toString('ascii') === '%PDF-';
+            if (looksPdf) pdfs.push({ buf });
+          } catch (_) { }
+        };
+        page.on('response', handler);
+        resolve({
+          stop: () => page.off('response', handler),
+          best: () => pdfs.sort((a, b) => (b.buf.length) - (a.buf.length))[0] || null
+        });
+      });
+    }
+
+    const mainCatch = await armPdfCatcher($page);
+    const popCatch = newTab ? await armPdfCatcher(newTab) : null;
+
+    // Let any late requests finish
+    await sleep(2000);
+
+    const bestNet = [popCatch && popCatch.best(), mainCatch.best()].filter(Boolean)
+      .sort((a, b) => b.buf.length - a.buf.length)[0] || null;
+    mainCatch.stop(); if (popCatch) popCatch.stop();
+
+    if (!bestNet) {
+      throw new Error('No Blob-captured PDF found and no PDF-like network response. The app may be opening print-HTML.');
+    }
+    allBufs.push(bestNet.buf);
+  }
+
+  // 7) Choose the biggest buffer and return as n8n binary (Input Binary Field = "proposal")
+  allBufs.sort((a, b) => b.length - a.length);
+  const best = allBufs[0];
+
+  const now = new Date();
+  const fileFormattedDate = [
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+    now.getFullYear()
+  ].join('');
+
+   return [{
+    json: { message: 'PDF captured successfully', email: '{{ $json.body.zoho_r_data.email }}', licenseNo: licenseNo },
+    binary: {
+      proposal: {
+        data: best.toString('base64'),
+        mimeType: 'application/pdf',
+        fileName: `${licenseNo}.pdf`
+      }
+    }
+  }];
 
   // Take a screenshot after the page has loaded 
   const sss = 'C:/InsuranceQuote/screenshot.png';
