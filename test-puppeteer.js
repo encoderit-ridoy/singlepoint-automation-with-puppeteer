@@ -10,7 +10,7 @@ const type = $json.type || 'auto';
 
 // Get the license number from the incoming JSON
 const licenseNo = '{{ $json.body.zoho_r_data.license_number }}' || 'SA5761048';
-// const licenseNo = 'AA5761048';
+// const licenseNo = 'FR576104800';
 
 // Ensure credentials are present
 if (!username || !password) {
@@ -1338,8 +1338,10 @@ else {
 
   // Fill out the form on the next page
   await $page.type('#driverFirstName', firstName, { delay: 30 });
+  await new Promise((resolve) => setTimeout(resolve, 100));
   await $page.type('#driverLastName', lastName, { delay: 30 });
- 
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
   const dobFormatted = formatDateToMMDDYYYY(dateStr);
   await $page.click('#driverDateOfBirth', { clickCount: 3 });
   await $page.keyboard.type(dobFormatted, { delay: 150 });
@@ -1358,10 +1360,20 @@ else {
     await $page.keyboard.press('Tab');
   }
 
-  await $page.type('#driverLicenseNumber', '{{ $json.body.step_4_driver_license_number_1 }}', { delay: 30 });
-  await $page.waitForSelector('#driverSdip', { visible: true });
-  await $page.type('#driverSdip', '00', { delay: 30 });
+ await $page.focus('#driverLicenseNumber');
+ await $page.type('#driverLicenseNumber', licenseNo, { delay: 150 });
   await $page.keyboard.press('Tab');
+
+  await $page.waitForSelector('#driverCurrentLicenseState', { timeout: 10000 });
+  await $page.click('#driverCurrentLicenseState', { clickCount: 3 });
+  await $page.keyboard.press('Backspace');
+  await $page.keyboard.type('FR', { delay: 100 });
+  await $page.keyboard.press('Tab');
+
+  await $page.waitForSelector('#driverSdip', { visible: true, timeout: 5000 }); // wait for the element to be visible
+  await $page.type('#driverSdip', '00', { delay: 100 }); // Type '00' into the input field with delay
+  await $page.keyboard.press('Tab');
+
 
   // Click the "Vehicles" tab
   await $page.click('.tabs__list .tabs__item a[href*="vehicles"]');
@@ -1599,7 +1611,7 @@ else {
   await $page.keyboard.type('10000', { delay: 100 });
   await $page.keyboard.press('Tab');
   await new Promise((resolve) => setTimeout(resolve, 1000));
-
+ 
   // Click the "Options" tab (using partial href match)
   await $page.click('.tabs__list .tabs__item a[href*="options"]');
 
@@ -2163,7 +2175,7 @@ else {
     }
     return false;
   });
-
+  
   // optional: wait for modal to close
   await $page.waitForFunction(
     () => !document.querySelector('.modalbox__content, .box--silver, [role="dialog"]'),
