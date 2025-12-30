@@ -101,7 +101,7 @@ if (licenseNo.startsWith('s') || licenseNo.startsWith('S')) {
   // Fill out the form on the next page
   await $page.type('#firstName0', firstName, { delay: 30 });
   await $page.type('#lastName0', lastName, { delay: 30 });
-  await $page.type('#licenseNumber0', '{{ $json.body.step_4_driver_license_number_1 }}', { delay: 30 });
+  await $page.type('#licenseNumber0', '{{ $json.body.zoho_r_data.license_number }}', { delay: 30 });
 
   const dobFormatted = formatDateToMMDDYYYY(dateStr);
 
@@ -1337,9 +1337,9 @@ else {
   const lastName = '{{ $json.body.step_4_driver_last_name_1 }}';
 
   // Fill out the form on the next page
-  await $page.type('#driverFirstName', firstName, { delay: 30 });
+  await $page.type('#driverFirstName', firstName, { delay: 100 });
   await new Promise((resolve) => setTimeout(resolve, 100));
-  await $page.type('#driverLastName', lastName, { delay: 30 });
+  await $page.type('#driverLastName', lastName, { delay: 150 });
   await new Promise((resolve) => setTimeout(resolve, 100));
 
   const dobFormatted = formatDateToMMDDYYYY(dateStr);
@@ -1367,14 +1367,65 @@ else {
   await $page.waitForSelector('#driverCurrentLicenseState', { timeout: 10000 });
   await $page.click('#driverCurrentLicenseState', { clickCount: 3 });
   await $page.keyboard.press('Backspace');
-  await $page.keyboard.type('FR', { delay: 100 });
+  await $page.keyboard.type('{{ $json.body.zoho_r_data.license_state }}', { delay: 100 });
   await $page.keyboard.press('Tab');
 
   await $page.waitForSelector('#driverSdip', { visible: true, timeout: 5000 }); // wait for the element to be visible
   await $page.type('#driverSdip', '00', { delay: 100 }); // Type '00' into the input field with delay
   await $page.keyboard.press('Tab');
 
+  await $page.waitForSelector('.aboutbox__title', { timeout: 10000 });
 
+await $page.evaluate(() => {
+  const box = Array.from(document.querySelectorAll('.aboutbox'))
+    .find(b => b.querySelector('.aboutbox__title')?.textContent.trim() === 'Client:');
+
+  if (!box) throw new Error('Client box not found');
+
+  const link = box.querySelector('a.aboutbox__link');
+  link.scrollIntoView({ block: 'center' });
+  link.click();
+});
+
+   // Wait for and fill the 'clientInfoAddrAddr1_StreetAddress' input
+  await $page.waitForSelector('#clientInfoAddrAddr1_StreetAddress', { timeout: 10000 });
+  await $page.click('#clientInfoAddrAddr1_StreetAddress', { clickCount: 3 });
+  await $page.keyboard.press('Backspace');
+  await $page.keyboard.type('{{ $json.body.step_1_data.address1 }}', { delay: 100 });
+
+  // Wait for and fill the 'clientInfoAddrCity_StreetAddress' input
+  await $page.waitForSelector('#clientInfoAddrCity_StreetAddress', { timeout: 10000 });
+  await $page.click('#clientInfoAddrCity_StreetAddress', { clickCount: 3 });
+  await $page.keyboard.press('Backspace');
+  await $page.keyboard.type('{{ $json.body.step_1_data.city }}', { delay: 100 });
+
+
+   await $page.waitForSelector('#clientInfoAddrState_StreetAddress', { timeout: 10000 });
+  await $page.click('#clientInfoAddrState_StreetAddress', { clickCount: 3 });
+  await $page.keyboard.press('Backspace');
+  await $page.keyboard.type('{{ $json.body.zoho_r_data.state }}', { delay: 100 });
+  await $page.keyboard.press('Tab');
+
+
+  // Wait for and fill the 'clientInfoAddrZip_StreetAddress' input
+  await $page.waitForSelector('#clientInfoAddrZip_StreetAddress', { timeout: 10000 });
+  await $page.click('#clientInfoAddrZip_StreetAddress', { clickCount: 3 });
+  await $page.keyboard.press('Backspace');
+  await $page.keyboard.type('{{ $json.body.step_1_data.zip }}', { delay: 100 });
+
+  await $page.waitForSelector('button.o-btn', { visible: true, timeout: 10000 });
+
+await $page.evaluate(() => {
+  const btn = Array.from(document.querySelectorAll('button.o-btn'))
+    .find(b => b.textContent.trim() === 'Update info');
+
+  if (!btn) throw new Error('Update info button not found');
+
+  btn.scrollIntoView({ block: 'center' });
+  btn.click();
+});
+ await new Promise(r => setTimeout(r, 5000));
+  
   // Click the "Vehicles" tab
   await $page.click('.tabs__list .tabs__item a[href*="vehicles"]');
   await new Promise(r => setTimeout(r, 1000));
@@ -1586,12 +1637,8 @@ else {
 
   // Wait for and fill the 'vehicleLocationZip' input
   await $page.waitForSelector('#vehicleLocationZip', { timeout: 10000 });
-
-  // Focus the input and clear any pre-existing value
   await $page.click('#vehicleLocationZip', { clickCount: 3 });
   await $page.keyboard.press('Backspace');
-
-  // Type the valid ZIP code '02142'
   await $page.keyboard.type('{{ $json.body.step_1_data.zip }}', { delay: 100 });
 
   // Ensure the value is accepted by dispatching events manually (to trigger pattern validation)
@@ -2224,24 +2271,7 @@ await $page.click('.tabs__list .tabs__item a[href*="premiums"]');
 
   await new Promise(r => setTimeout(r, 60000));
 
-  const clickedRate = await $page.evaluate(() => {
-    // Find all rows in the premium table
-    const rows = Array.from(document.querySelectorAll('table.table tbody tr'));
-    for (const row of rows) {
-      const text = (row.innerText || '').trim();
-      if (/MAIP\s*\(CAR\)/i.test(text)) {
-        // Inside that row, find a Rate button
-        const btn = row.querySelector('button.o-btn, button');
-        if (btn && /rate/i.test((btn.textContent || '').trim())) {
-          btn.scrollIntoView({ block: 'center' });
-          btn.click();
-          return true;
-        }
-      }
-    }
-    return false;
-  });
-
+ 
   // Optional: wait for next page or processing
   await new Promise(r => setTimeout(r, 60000));
   // --- Click the "View plan summary" button for MAIP (CAR) ---
