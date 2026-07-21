@@ -3,6 +3,18 @@
 //  Full script: login → driver → vehicles → options → premiums → PDF
 //  Compatible with n8n "Execute Browser" / Puppeteer node.
 //  No external packages required.
+//
+//  CHANGE LOG (this revision):
+//   - vehicleTrim now falls back to "first available option" instead of
+//     typing an empty string when step_5_reg_type_1 / v1_trim is missing.
+//   - Premiums flow rewritten to match the real DOM: after "Rate All
+//     Plans", wait ~30s, then scan the table for the first ENABLED
+//     "View plan summary" button and click it. MAIP (CAR) / MAPFRE never
+//     expose that button (they use a "Review" flow instead), which is why
+//     the old MAIP-specific logic dead-ended and caused the
+//     #tooltipLauncherPrint timeout.
+//   - #tooltipLauncherPrint wait now retries opening the plan summary up
+//     to 3x with a diagnostic screenshot + clear error on final failure.
 // ============================================================
 
 // ─────────────────────────────────────────────────────────────
@@ -160,6 +172,41 @@ async function fillSelectLike(page, inputSel, value) {
   const ok = await pickByTextRobust(page, inputSel, value);
   await page.keyboard.press("Tab").catch(() => {});
   return ok;
+}
+
+// NEW: when we don't have a specific value to type (e.g. trim missing from
+// the webhook payload), open the dropdown and just take whatever the first
+// visible option is, instead of typing an empty string and matching garbage.
+async function selectFirstAvailableOption(page, inputSel) {
+  await openSelectLike(page, inputSel);
+  await sleep(400);
+  const picked = await page.evaluate(() => {
+    const sels = [
+      '.cdk-overlay-container [role="option"]',
+      '.cdk-overlay-pane [role="option"]',
+      ".mat-select-panel .mat-option",
+      ".ng-dropdown-panel .ng-option",
+      ".ng-select .ng-option",
+      ".sm-input-select__menu .sm-input-select__option",
+      ".autocomplete__menu .autocomplete__item",
+      ".dropdown-menu .dropdown-item",
+      '[role="listbox"] [role="option"]',
+      '[role="option"]',
+    ];
+    for (const sel of sels) {
+      const vis = Array.from(document.querySelectorAll(sel)).filter(
+        (n) => !!(n.offsetParent || n.getClientRects().length),
+      );
+      if (vis.length) {
+        vis[0].dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        vis[0].click();
+        return true;
+      }
+    }
+    return false;
+  });
+  await page.keyboard.press("Tab").catch(() => {});
+  return picked;
 }
 
 // Robustly fill an autocomplete that is just a number (e.g. yearsWithThisCarrier)
@@ -390,13 +437,58 @@ async function saveModal(page) {
     .catch(() => {});
 }
 
+// NEW: scan the premiums table for the first ENABLED "View plan summary"
+// button and click it. Confirmed from the live DOM:
+//   - Carriers like Progressive / Arbella get a $ premium tag + a
+//     "View plan summary" button once rated.
+//   - MAIP (CAR) and MAPFRE never get that button at all — they get a
+//     "Review" button instead (manual underwriting flow, out of scope
+//     for this automation).
+//   - Travelers (or others) that fail rating get an "Error" / "Review
+//     Error" button, also not a summary.
+// So there's no such thing as "waiting for MAIP to rate" — we just need
+// to wait for ANY carrier row to finish and expose "View plan summary".
+async function findAndOpenPlanSummary(page) {
+  return page.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll("table.table tbody tr"));
+    for (const row of rows) {
+      const btn = Array.from(row.querySelectorAll("button")).find((b) =>
+        /^\s*view\s*plan\s*summary\s*$/i.test((b.textContent || "").trim()),
+      );
+      if (btn && btn.offsetParent !== null && !btn.disabled) {
+        btn.scrollIntoView({ block: "center" });
+        btn.click();
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
 // ─────────────────────────────────────────────────────────────
 //  1.  INPUT DATA
 // ─────────────────────────────────────────────────────────────
 
 const USERNAME = "agent1";
 const PASSWORD = "Singapore@2025";
-const INSURANCE_TYPE = $json.type || "auto";
+
+// NOTE: the webhook payload has no top-level "type" field (fields live
+// under $json.body). $json.type will always be undefined, so this used to
+// silently fall back to "auto" every time — correct for this form by
+// coincidence, not by design. Deriving from form_id makes it correct on
+// purpose and safe if other form_ids ever get routed through this node.
+const formId = String($json.body?.form_id || "").toUpperCase();
+const INSURANCE_TYPE =
+  $json.type ||
+  (formId.startsWith("AUTO")
+    ? "auto"
+    : formId.startsWith("HOME")
+      ? "home"
+      : formId.startsWith("DWELLING")
+        ? "dwelling"
+        : formId.startsWith("UMBRELLA")
+          ? "umbrella"
+          : "auto");
 
 const licenseNo = String($json.body?.d1_lic_num || "").trim();
 const firstName = String($json.body?.first_name || "").trim();
@@ -408,7 +500,15 @@ const vehicleVin = String($json.body?.v1_vin || "").trim();
 const vehicleYear = String($json.body?.v1_year || "2016").trim();
 const vehicleMake = String($json.body?.v1_make || "Subaru").trim();
 const vehicleModel = String($json.body?.v1_model || "OUTBACK").trim();
-const vehicleTrim = String($json.body?.step_5_reg_type_1 || "").trim();
+// NOTE: the current webhook payload does not send step_5_reg_type_1 at all
+// (checked against a live sample) — it only sends v1_year/v1_make/v1_model.
+// v1_trim is included as an alt name in case the form is updated later.
+// If both are missing, vehicleTrim stays "" and the Vehicles-tab logic
+// below now falls back to selecting the first available trim option
+// instead of typing an empty string into the autocomplete.
+const vehicleTrim = String(
+  $json.body?.v1_trim || $json.body?.step_5_reg_type_1 || "",
+).trim();
 const vehicleZip = String($json.body?.v1_zip || "").trim();
 const address1 = String($json.body?.residential_address || "").trim();
 const city = String(
@@ -710,13 +810,29 @@ if (vehicleVin) {
   await fillSelectLike($page, "#vehicleModel", vehicleModel);
   await sleep(700);
 
-  // Trim with one retry
-  let trimPicked = await fillSelectLike($page, "#vehicleTrim", vehicleTrim);
-  if (!trimPicked) {
-    await sleep(800);
-    trimPicked = await fillSelectLike($page, "#vehicleTrim", vehicleTrim);
+  // Trim: only try to match by name if we actually have a value. If the
+  // webhook didn't send one (current form doesn't), pick the first
+  // available option instead of typing "" — that was leaving the field in
+  // an inconsistent state that could break rating downstream.
+  if (vehicleTrim) {
+    let trimPicked = await fillSelectLike($page, "#vehicleTrim", vehicleTrim);
+    if (!trimPicked) {
+      await sleep(800);
+      trimPicked = await fillSelectLike($page, "#vehicleTrim", vehicleTrim);
+    }
+    if (!trimPicked) {
+      console.warn(
+        "Could not select trim by name, falling back to first available option:",
+        vehicleTrim,
+      );
+      await selectFirstAvailableOption($page, "#vehicleTrim");
+    }
+  } else {
+    console.warn(
+      "No trim value supplied by webhook (v1_trim / step_5_reg_type_1 missing) — selecting first available trim option.",
+    );
+    await selectFirstAvailableOption($page, "#vehicleTrim");
   }
-  if (!trimPicked) console.warn("Could not select trim:", vehicleTrim);
 }
 
 // Vehicle location
@@ -843,11 +959,7 @@ await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
 // Take a screenshot after the page has loaded
 const sss4 = "C:/InsuranceQuote/screenshot4.png";
 await $page.screenshot({ path: sss4, fullPage: true });
-// return [
-//   {
-//     json: { message: "PDF captured successfully", licenseNo: licenseNo },
-//   },
-// ];
+
 // Save quote
 await $page.waitForSelector("button.app-button.app-button--save-quote", {
   visible: true,
@@ -888,45 +1000,30 @@ const rateAllClicked = await $page.evaluate(() => {
 });
 if (!rateAllClicked) throw new Error('Could not click "Rate All Plans"');
 
-// Wait for rating to complete (up to 2 minutes)
-await sleep(60000);
-
-// Click the Rate button for MAIP (CAR) row if present
-await $page.evaluate(() => {
-  const rows = Array.from(document.querySelectorAll("table.table tbody tr"));
-  for (const row of rows) {
-    if (!/MAIP\s*\(CAR\)/i.test(row.innerText || "")) continue;
-    const btn = row.querySelector("button.o-btn, button");
-    if (btn && /rate/i.test((btn.textContent || "").trim())) {
-      btn.scrollIntoView({ block: "center" });
-      btn.click();
-      return true;
-    }
-  }
-  return false;
-});
-
-// Wait for MAIP rate to finish
-await sleep(60000);
-
-// View plan summary for MAIP (CAR)
-await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
-await $page.evaluate(() => {
-  const rows = Array.from(document.querySelectorAll("table.table tbody tr"));
-  for (const row of rows) {
-    if (!/MAIP\s*\(CAR\)/i.test(row.innerText || "")) continue;
-    const btn = row.querySelector(
-      "button.o-btn.o-btn--outlined.o-btn--i_search-plus",
-    );
-    if (btn && /view\s*plan\s*summary/i.test((btn.textContent || "").trim())) {
-      btn.scrollIntoView({ block: "center" });
-      btn.click();
-      return true;
-    }
-  }
-  return false;
-});
+// Give the site time to actually rate every carrier before we go looking
+// for results. 30s covers the normal case; we still poll a bit past that
+// as a safety margin rather than failing the instant 30s is up.
 await sleep(30000);
+
+await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
+
+let summaryOpened = await findAndOpenPlanSummary($page);
+// Some carriers post their premium slower than others. Retry a few more
+// times (5s apart, ~30s extra) before giving up, instead of a single
+// all-or-nothing check right at the 30s mark.
+for (let attempt = 0; attempt < 6 && !summaryOpened; attempt++) {
+  await sleep(5000);
+  summaryOpened = await findAndOpenPlanSummary($page);
+}
+
+if (!summaryOpened) {
+  const sssNoPlans = "C:/InsuranceQuote/screenshot_error_no_plans.png";
+  await $page.screenshot({ path: sssNoPlans, fullPage: true }).catch(() => {});
+  throw new Error(
+    "No plan row with a 'View Plan Summary' button was found after ~60s of waiting. This means rating either hasn't finished, failed outright, or every carrier landed on 'Review'/'Error' instead of a summary (MAIP (CAR) and MAPFRE never expose 'View Plan Summary' — that's expected, not a bug). See screenshot_error_no_plans.png.",
+  );
+}
+await sleep(3000);
 
 // ─────────────────────────────────────────────────────────────
 //  8.  CAPTURE PDF — intercept Blob created by "Print Long Proposal"
@@ -974,8 +1071,37 @@ const popupPromise = new Promise((resolve) => {
   });
 });
 
-// Open print menu and click "Print Long Proposal"
-await $page.waitForSelector("#tooltipLauncherPrint", { timeout: 10000 });
+// The print launcher only exists once the plan summary/proposal panel has
+// actually rendered. Instead of a single wait that either finds it or
+// throws a bare timeout, retry re-opening the summary a couple of times
+// and take a diagnostic screenshot before giving up with a clear message.
+let printLauncherFound = false;
+for (let attempt = 0; attempt < 3 && !printLauncherFound; attempt++) {
+  printLauncherFound = await $page
+    .waitForSelector("#tooltipLauncherPrint", { timeout: 15000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!printLauncherFound) {
+    console.warn(
+      `#tooltipLauncherPrint not found (attempt ${attempt + 1}/3), retrying plan summary...`,
+    );
+    await findAndOpenPlanSummary($page).catch(() => {});
+    await sleep(3000);
+  }
+}
+
+if (!printLauncherFound) {
+  await $page
+    .screenshot({
+      path: "C:/InsuranceQuote/screenshot_error_no_print_launcher.png",
+      fullPage: true,
+    })
+    .catch(() => {});
+  throw new Error(
+    "Plan summary/proposal page never rendered the print launcher after 3 attempts — most likely no rated plan was actually available to view. Check screenshot_error_no_print_launcher.png and screenshot4.png (Premiums tab) to see what rating actually returned.",
+  );
+}
+
 await $page.$eval("#tooltipLauncherPrint", (el) => {
   el.scrollIntoView({ block: "center" });
   el.click();
