@@ -409,7 +409,6 @@ const cancelledPolicies = [];
 
 // Track renewal dates
 const upcomingRenewals = [];
-let mostRecentEffectiveDate = null;
 
 policies.forEach((policy, policyIndex) => {
   try {
@@ -532,32 +531,6 @@ policies.forEach((policy, policyIndex) => {
       // if (daysSinceEffective >= 30 && daysSinceEffective <= 60) {
       //   ghlContact.tags.push("Policy-30-Days");
       // }
-    }
-
-    // ============================================================
-    // TRACK MOST RECENT POLICY EFFECTIVE DATE (for NPS survey anchor)
-    // ============================================================
-    if (isActive && effectiveDate) {
-      const effDateObj = new Date(effectiveDate);
-      if (isNaN(effDateObj.getTime())) {
-        console.log(
-          `NPS date: could not parse effectiveDate "${effectiveDate}" for policy ${policyNum}`,
-        );
-      } else {
-        const currentBest = mostRecentEffectiveDate
-          ? new Date(mostRecentEffectiveDate)
-          : null;
-        if (!currentBest || effDateObj > currentBest) {
-          console.log(
-            `NPS date: updating anchor from ${mostRecentEffectiveDate} to ${effectiveDate} (policy ${policyNum})`,
-          );
-          mostRecentEffectiveDate = effectiveDate;
-        }
-      }
-    } else {
-      console.log(
-        `NPS date: skipped policy ${policyNum} — isActive=${isActive}, effectiveDate="${effectiveDate}"`,
-      );
     }
 
     // ============================================================
@@ -878,10 +851,6 @@ ghlContact.customFields.active_policies_count = activePolicies.length;
 ghlContact.customFields.prospect_policies_count = prospectPolicies.length;
 ghlContact.customFields.cancelled_policies_count = cancelledPolicies.length;
 
-// NPS survey anchor date — most recent active-policy effective date across all policies
-if (mostRecentEffectiveDate) {
-  ghlContact.customFields.nps_date = formatDate(mostRecentEffectiveDate);
-}
 
 // ============================================================
 // MULTI-POLICY TAGS
