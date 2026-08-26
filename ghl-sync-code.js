@@ -259,7 +259,7 @@ if (producer) ghlContact.tags.push(`Producer-${producer}`);
 if (csr) ghlContact.tags.push(`CSR-${csr}`);
 
 if (safeGet(details, "doNotMarket", false)) {
-  ghlContact.tags.push("DND-Marketing");
+  ghlContact.tags.push("do-not-market");
   ghlContact.dnd = true;
 }
 
