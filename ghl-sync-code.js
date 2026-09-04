@@ -444,6 +444,7 @@ policies.forEach((policy, policyIndex) => {
     const paymentPlan = cleanString(safeGet(policy, "paymentPlan", ""));
     const agent1 = cleanString(safeGet(policy, "agent1", ""));
     const agent2 = cleanString(safeGet(policy, "agent2", ""));
+    const modified_at = cleanString(safeGet(policy, "modified", ""));
 
     // Track policy status
     const isActive =
@@ -587,13 +588,13 @@ policies.forEach((policy, policyIndex) => {
       ghlContact.customFields[`${prefix}number_of_terms`] = numberOfTerms;
     if (agent1) ghlContact.customFields[`${prefix}agent1`] = agent1;
     if (agent2) ghlContact.customFields[`${prefix}agent2`] = agent2;
-
-    // Carrier tags
-    if (carrier && carrier !== "<Prospect>") {
-      ghlContact.tags.push(`Carrier-${carrier.replace(/\s+/g, "-")}`);
-    } else if (carrier === "<Prospect>") {
-      ghlContact.tags.push("Prospect-Carrier");
-    }
+    if (modified_at) ghlContact.customFields[`${prefix}modified_at`] = modified_at;
+      if (carrier && carrier !== "<Prospect>") {
+        // Carrier tags
+        ghlContact.tags.push(`Carrier-${carrier.replace(/\s+/g, "-")}`);
+      } else if (carrier === "<Prospect>") {
+        ghlContact.tags.push("Prospect-Carrier");
+      }
 
     // Billing tags
     if (billingType.toLowerCase() === "agency") {
