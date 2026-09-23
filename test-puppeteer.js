@@ -14,7 +14,7 @@
 //     the old MAIP-specific logic dead-ended and caused the
 //     #tooltipLauncherPrint timeout.
 //   - #tooltipLauncherPrint wait now retries opening the plan summary up
-//     to 3x with a diagnostic screenshot + clear error on final failure.
+//     to 3x with a clear error on final failure.
 // ============================================================
 
 // ─────────────────────────────────────────────────────────────
@@ -672,9 +672,6 @@ if (isRmvFlow) {
   await $page.type("#driverSdip", "00", { delay: 100 });
   await $page.keyboard.press("Tab");
   await sleep(500);
-  // Take a screenshot after the page has loaded
-  const sss1 = "C:/InsuranceQuote/screenshot1.png";
-  await $page.screenshot({ path: sss1, fullPage: true });
 } else {
   // ── 4B. MANUAL ENTRY FLOW ────────────────────────────────
   await $page.waitForSelector(".sm-popup.is-active", { timeout: 30000 });
@@ -864,9 +861,6 @@ await $page.keyboard.press("Backspace");
 await $page.keyboard.type("10000", { delay: 100 });
 await $page.keyboard.press("Tab");
 await sleep(1000);
-// Take a screenshot after the page has loaded
-const sss2 = "C:/InsuranceQuote/screenshot2.png";
-await $page.screenshot({ path: sss2, fullPage: true });
 // ─────────────────────────────────────────────────────────────
 //  6.  OPTIONS TAB
 // ─────────────────────────────────────────────────────────────
@@ -947,18 +941,12 @@ await saveModal($page);
 await ensureChecked($page, "BSC-AUTO-002152_TravelersPrimaryResidenceType");
 await pickModalRadio($page, /^other$/, "first");
 await saveModal($page);
-// Take a screenshot after the page has loaded
-const sss3 = "C:/InsuranceQuote/screenshot3.png";
-await $page.screenshot({ path: sss3, fullPage: true });
 // ─────────────────────────────────────────────────────────────
 //  7.  PREMIUMS TAB
 // ─────────────────────────────────────────────────────────────
 
 await $page.click('.tabs__list .tabs__item a[href*="premiums"]');
 await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
-// Take a screenshot after the page has loaded
-const sss4 = "C:/InsuranceQuote/screenshot4.png";
-await $page.screenshot({ path: sss4, fullPage: true });
 
 // Save quote
 await $page.waitForSelector("button.app-button.app-button--save-quote", {
@@ -1017,10 +1005,8 @@ for (let attempt = 0; attempt < 6 && !summaryOpened; attempt++) {
 }
 
 if (!summaryOpened) {
-  const sssNoPlans = "C:/InsuranceQuote/screenshot_error_no_plans.png";
-  await $page.screenshot({ path: sssNoPlans, fullPage: true }).catch(() => {});
   throw new Error(
-    "No plan row with a 'View Plan Summary' button was found after ~60s of waiting. This means rating either hasn't finished, failed outright, or every carrier landed on 'Review'/'Error' instead of a summary (MAIP (CAR) and MAPFRE never expose 'View Plan Summary' — that's expected, not a bug). See screenshot_error_no_plans.png.",
+    "No plan row with a 'View Plan Summary' button was found after ~60s of waiting. This means rating either hasn't finished, failed outright, or every carrier landed on 'Review'/'Error' instead of a summary (MAIP (CAR) and MAPFRE never expose 'View Plan Summary' — that's expected, not a bug).",
   );
 }
 await sleep(3000);
@@ -1074,7 +1060,7 @@ const popupPromise = new Promise((resolve) => {
 // The print launcher only exists once the plan summary/proposal panel has
 // actually rendered. Instead of a single wait that either finds it or
 // throws a bare timeout, retry re-opening the summary a couple of times
-// and take a diagnostic screenshot before giving up with a clear message.
+// before giving up with a clear message.
 let printLauncherFound = false;
 for (let attempt = 0; attempt < 3 && !printLauncherFound; attempt++) {
   printLauncherFound = await $page
@@ -1091,14 +1077,8 @@ for (let attempt = 0; attempt < 3 && !printLauncherFound; attempt++) {
 }
 
 if (!printLauncherFound) {
-  await $page
-    .screenshot({
-      path: "C:/InsuranceQuote/screenshot_error_no_print_launcher.png",
-      fullPage: true,
-    })
-    .catch(() => {});
   throw new Error(
-    "Plan summary/proposal page never rendered the print launcher after 3 attempts — most likely no rated plan was actually available to view. Check screenshot_error_no_print_launcher.png and screenshot4.png (Premiums tab) to see what rating actually returned.",
+    "Plan summary/proposal page never rendered the print launcher after 3 attempts — most likely no rated plan was actually available to view. Check the Premiums tab to see what rating actually returned.",
   );
 }
 
