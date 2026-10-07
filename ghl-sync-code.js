@@ -94,6 +94,37 @@ function isFlagOn(value) {
 }
 
 // ============================================================
+// PRODUCER DIRECTORY
+// Key = producer code (initials) as it comes from HawkSoft details.producer
+// ============================================================
+
+const PRODUCERS = {
+  DRA: {
+    firstName: "Duke",
+    lastName: "Rateau",
+    title: "Principal Agent",
+    npn: "5422278",
+  },
+  NAS: {
+    firstName: "Nayanne",
+    lastName: "Silva",
+    title: "Insurance Agent",
+    npn: "22158701",
+  },
+  JRN: {
+    firstName: "Jean Rodney",
+    lastName: "Nerestant",
+    title: "Insurance Agent",
+    npn: "15904995",
+  },
+};
+
+function getProducer(code) {
+  const key = cleanString(code).toUpperCase();
+  return PRODUCERS[key] || null;
+}
+
+// ============================================================
 // EXTRACT CLIENT INFO
 // ============================================================
 
@@ -266,9 +297,17 @@ if (isCommercial) {
   );
 }
 
-ghlContact.customFields.producer = cleanString(
-  safeGet(details, "producer", ""),
-);
+const producerCode = cleanString(safeGet(details, "producer", "")).toUpperCase();
+const producerInfo = getProducer(producerCode);
+
+ghlContact.customFields.producer = producerCode;
+ghlContact.customFields.producer_code = producerCode;
+if (producerInfo) {
+  ghlContact.customFields.producer_first_name = producerInfo.firstName;
+  ghlContact.customFields.producer_last_name = producerInfo.lastName;
+  ghlContact.customFields.producer_title = producerInfo.title;
+  ghlContact.customFields.producer_npn = producerInfo.npn;
+}
 ghlContact.customFields.csr = cleanString(safeGet(details, "csr", ""));
 ghlContact.customFields.office_id = String(safeGet(details, "officeId", ""));
 
