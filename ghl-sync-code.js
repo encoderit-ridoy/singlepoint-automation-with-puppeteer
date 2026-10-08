@@ -104,18 +104,21 @@ const PRODUCERS = {
     lastName: "Rateau",
     title: "Principal Agent",
     npn: "5422278",
+    mobile: "",
   },
   NAS: {
     firstName: "Nayanne",
     lastName: "Silva",
     title: "Insurance Agent",
     npn: "22158701",
+    mobile: "",
   },
   JRN: {
     firstName: "Jean Rodney",
     lastName: "Nerestant",
     title: "Insurance Agent",
     npn: "15904995",
+    mobile: "",
   },
 };
 
@@ -307,6 +310,7 @@ if (producerInfo) {
   ghlContact.customFields.producer_last_name = producerInfo.lastName;
   ghlContact.customFields.producer_title = producerInfo.title;
   ghlContact.customFields.producer_npn = producerInfo.npn;
+  ghlContact.customFields.producer_mobile = producerInfo.mobile;
 }
 ghlContact.customFields.csr = cleanString(safeGet(details, "csr", ""));
 ghlContact.customFields.office_id = String(safeGet(details, "officeId", ""));
