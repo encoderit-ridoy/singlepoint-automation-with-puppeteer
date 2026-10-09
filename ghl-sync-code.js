@@ -300,20 +300,20 @@ if (isCommercial) {
   );
 }
 
-const producerCode = cleanString(
+const rawProducerCode = cleanString(
   safeGet(details, "producer", ""),
 ).toUpperCase();
+// Unknown or missing producer falls back to DRA
+const producerCode = getProducer(rawProducerCode) ? rawProducerCode : "DRA";
 const producerInfo = getProducer(producerCode);
 
 ghlContact.customFields.producer = producerCode;
 ghlContact.customFields.producer_code = producerCode;
-if (producerInfo) {
-  ghlContact.customFields.producer_first_name = producerInfo.firstName;
-  ghlContact.customFields.producer_last_name = producerInfo.lastName;
-  ghlContact.customFields.producer_title = producerInfo.title;
-  ghlContact.customFields.producer_npn = producerInfo.npn;
-  ghlContact.customFields.producer_mobile = producerInfo.mobile;
-}
+ghlContact.customFields.producer_first_name = producerInfo.firstName;
+ghlContact.customFields.producer_last_name = producerInfo.lastName;
+ghlContact.customFields.producer_title = producerInfo.title;
+ghlContact.customFields.producer_npn = producerInfo.npn;
+ghlContact.customFields.producer_mobile = producerInfo.mobile;
 ghlContact.customFields.csr = cleanString(safeGet(details, "csr", ""));
 ghlContact.customFields.office_id = String(safeGet(details, "officeId", ""));
 
