@@ -529,20 +529,60 @@ await $page.goto("https://apps.singlepointrating.com/webapps/sprapp/#/login", {
   timeout: 30000,
 });
 
-await $page.waitForSelector('input[name="UserName"]', { timeout: 15000 });
-await $page.click('input[name="UserName"]', { clickCount: 3 }).catch(() => {});
-await $page.type('input[name="UserName"]', USERNAME, { delay: 30 });
+// The SPA renders the form after networkidle2, and the field name casing
+// isn't guaranteed — match loosely. If a previous session is still active
+// the app skips the login form and lands on the dashboard (.sidebox).
+const USER_SEL =
+  'input[name="UserName" i], input#UserName, input[name="login" i], input[type="email"], form input[type="text"]';
+const PASS_SEL = 'input[name="Password" i], input[type="password"]';
 
-await $page.waitForSelector('input[name="Password"]', { timeout: 10000 });
-await $page.click('input[name="Password"]', { clickCount: 3 }).catch(() => {});
-await $page.type('input[name="Password"]', PASSWORD, { delay: 30 });
+const loginState = await $page
+  .waitForFunction(
+    (u) => {
+      if (document.querySelector(".sidebox .app-button-square"))
+        return "loggedIn";
+      const el = document.querySelector(u);
+      if (el && (el.offsetParent || el.getClientRects().length)) return "form";
+      return false;
+    },
+    { timeout: 45000, polling: 500 },
+    USER_SEL,
+  )
+  .then((h) => h.jsonValue())
+  .catch(() => null);
 
-await Promise.all([
-  $page.click("button.o-btn.o-btn--large"),
-  $page
-    .waitForNavigation({ waitUntil: "networkidle2", timeout: 20000 })
-    .catch(() => {}),
-]);
+if (!loginState) {
+  const debug = await $page
+    .evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      inputs: Array.from(document.querySelectorAll("input")).map(
+        (i) => `${i.tagName} name=${i.name} id=${i.id} type=${i.type}`,
+      ),
+    }))
+    .catch(() => ({}));
+  throw new Error(
+    `Login form not found after 45s. Page state: ${JSON.stringify(debug)}`,
+  );
+}
+
+if (loginState === "form") {
+  await $page.click(USER_SEL, { clickCount: 3 }).catch(() => {});
+  await $page.type(USER_SEL, USERNAME, { delay: 30 });
+
+  await $page.waitForSelector(PASS_SEL, { visible: true, timeout: 10000 });
+  await $page.click(PASS_SEL, { clickCount: 3 }).catch(() => {});
+  await $page.type(PASS_SEL, PASSWORD, { delay: 30 });
+
+  await Promise.all([
+    $page.click("button.o-btn.o-btn--large"),
+    $page
+      .waitForNavigation({ waitUntil: "networkidle2", timeout: 20000 })
+      .catch(() => {}),
+  ]);
+} else {
+  console.log("Existing session detected — skipping login form.");
+}
 
 await $page.waitForSelector(".sidebox", { timeout: 15000 }).catch(() => {});
 await $page.waitForSelector(".sidebox .app-button-square", { timeout: 10000 });
