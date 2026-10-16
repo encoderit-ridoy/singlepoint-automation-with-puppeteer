@@ -2,7 +2,7 @@
 // HAWKSOFT TO GHL TRANSFORMATION - V4
 // Simplified tagging: HS Lead + one lifecycle tag + do-not-market
 //   Lifecycle (mutually exclusive, priority order):
-//     1. Active-Client    -> any policy Active / Renewal / Inforce
+//     1. Active-Client    -> any policy Active / New / Renewal / Inforce
 //     2. Prospect-Client  -> no active, has Prospect policy (or no policies / client status Prospect)
 //     3. Former-Client    -> no active/prospect, has Cancelled / Nonrenew / Expired policy
 // All custom fields unchanged from V3.
@@ -341,6 +341,9 @@ const policies = safeArray(safeGet(hawksoftClient, "policies", []));
 let totalPremium = 0;
 let totalQuotedPremium = 0;
 
+// "New" policies count as active (same as Active / Renewal / Inforce)
+const ACTIVE_STATUSES = new Set(["active", "new", "renewal", "inforce"]);
+
 const activePolicies = [];
 const prospectPolicies = [];
 const cancelledPolicies = [];
@@ -380,10 +383,11 @@ policies.forEach((policy, policyIndex) => {
     const modified_at = cleanString(safeGet(policy, "modified", ""));
 
     // ---- Status classification ----
-    const s = policyStatus.toLowerCase();
-    const isActive = s === "active" || s === "renewal" || s === "inforce";
+    // Normalized: lowercase, spaces/hyphens/underscores removed ("In Force" == "inforce")
+    const s = policyStatus.toLowerCase().replace(/[\s_-]+/g, "");
+    const isActive = ACTIVE_STATUSES.has(s);
     const isProspect = s === "prospect";
-    const isCancelled = s === "cancelled" || s === "nonrenew";
+    const isCancelled = s === "cancelled" || s === "canceled" || s === "nonrenew";
     const isExpired = s === "expired";
 
     if (isActive) {
@@ -549,19 +553,17 @@ if (upcomingRenewals.length > 0) {
 // LIFECYCLE TAG (exactly one)
 // ============================================================
 
+const hasActive = activePolicies.length > 0;
+const hasProspect = prospectPolicies.length > 0;
+const hasLapsed = cancelledPolicies.length > 0 || expiredPolicies.length > 0;
+
 let lifecycleTag;
-if (activePolicies.length > 0) {
-  lifecycleTag = "Active-Client";
-} else if (
-  prospectPolicies.length > 0 ||
-  policies.length === 0 ||
-  clientStatus.toLowerCase() === "prospect"
-) {
-  lifecycleTag = "Prospect-Client";
-} else if (cancelledPolicies.length > 0 || expiredPolicies.length > 0) {
-  lifecycleTag = "Former-Client";
-}
-if (lifecycleTag) ghlContact.tags.push(lifecycleTag);
+if (hasActive) lifecycleTag = "Active-Client";
+else if (hasProspect) lifecycleTag = "Prospect-Client";
+else if (hasLapsed) lifecycleTag = "Former-Client";
+else lifecycleTag = "Prospect-Client"; // no policies, or only unrecognized statuses
+
+ghlContact.tags.push(lifecycleTag);
 
 // ============================================================
 // CLIENTCIRCLE NPS SUPPRESSION (2026)
