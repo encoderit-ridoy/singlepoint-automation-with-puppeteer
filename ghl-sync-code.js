@@ -394,7 +394,7 @@ policies.forEach((policy, policyIndex) => {
       activePolicies.push({ type: policyTitle, premium, expirationDate });
     }
     if (isProspect) prospectPolicies.push({ type: policyTitle });
-    if (isCancelled) cancelledPolicies.push({ type: policyTitle });
+    if (isCancelled) cancelledPolicies.push({ type: policyTitle, applicationType });
     if (isExpired) expiredPolicies.push({ type: policyTitle });
 
     totalPremium += premium;
@@ -564,6 +564,12 @@ else if (hasLapsed) lifecycleTag = "Inactive-Client";
 else lifecycleTag = "Prospect-Client"; // no policies, or only unrecognized statuses
 
 ghlContact.tags.push(lifecycleTag);
+
+// Cancelled commercial policy -> "Commercial" tag (personal lines get nothing)
+const hasCancelledCommercial = cancelledPolicies.some((p) =>
+  p.applicationType.toLowerCase().includes("commercial"),
+);
+if (hasCancelledCommercial) ghlContact.tags.push("Commercial");
 
 // ============================================================
 // CLIENTCIRCLE NPS SUPPRESSION (2026)
