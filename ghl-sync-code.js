@@ -4,7 +4,7 @@
 //   Lifecycle (mutually exclusive, priority order):
 //     1. Active-Client    -> any policy Active / New / Renewal / Inforce
 //     2. Prospect-Client  -> no active, has Prospect policy (or no policies / client status Prospect)
-//     3. Former-Client    -> no active/prospect, has Cancelled / Nonrenew / Expired policy
+//     3. Inactive-Client  -> no active/prospect, has Cancelled / Nonrenew / Expired policy
 // All custom fields unchanged from V3.
 // ============================================================
 
@@ -560,7 +560,7 @@ const hasLapsed = cancelledPolicies.length > 0 || expiredPolicies.length > 0;
 let lifecycleTag;
 if (hasActive) lifecycleTag = "Active-Client";
 else if (hasProspect) lifecycleTag = "Prospect-Client";
-else if (hasLapsed) lifecycleTag = "Former-Client";
+else if (hasLapsed) lifecycleTag = "Inactive-Client";
 else lifecycleTag = "Prospect-Client"; // no policies, or only unrecognized statuses
 
 ghlContact.tags.push(lifecycleTag);
