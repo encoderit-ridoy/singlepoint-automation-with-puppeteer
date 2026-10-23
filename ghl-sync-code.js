@@ -105,6 +105,7 @@ const PRODUCERS = {
     title: "Principal Agent",
     npn: "5422278",
     mobile: "617-201-7102",
+    email: "rateau@econosurance.com",
   },
   NAS: {
     firstName: "Nayanne",
@@ -112,6 +113,7 @@ const PRODUCERS = {
     title: "Insurance Agent",
     npn: "22158701",
     mobile: "978-448-1884",
+    email: "nayanne@econosurance.com",
   },
   JRN: {
     firstName: "Jean Rodney",
@@ -119,6 +121,7 @@ const PRODUCERS = {
     title: "Insurance Agent",
     npn: "15904995",
     mobile: "",
+    email: "rodney@econosurance.com",
   },
 };
 
@@ -314,6 +317,7 @@ ghlContact.customFields.producer_last_name = producerInfo.lastName;
 ghlContact.customFields.producer_title = producerInfo.title;
 ghlContact.customFields.producer_npn = producerInfo.npn;
 ghlContact.customFields.producer_mobile = producerInfo.mobile;
+ghlContact.customFields.producer_email = producerInfo.email;
 ghlContact.customFields.csr = cleanString(safeGet(details, "csr", ""));
 ghlContact.customFields.office_id = String(safeGet(details, "officeId", ""));
 
