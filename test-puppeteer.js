@@ -447,22 +447,266 @@ async function saveModal(page) {
 //   - Travelers (or others) that fail rating get an "Error" / "Review
 //     Error" button, also not a summary.
 // So there's no such thing as "waiting for MAIP to rate" — we just need
-// to wait for ANY carrier row to finish and expose "View plan summary".
-async function findAndOpenPlanSummary(page) {
-  return page.evaluate(() => {
-    const rows = Array.from(document.querySelectorAll("table.table tbody tr"));
-    for (const row of rows) {
-      const btn = Array.from(row.querySelectorAll("button")).find((b) =>
-        /^\s*view\s*plan\s*summary\s*$/i.test((b.textContent || "").trim()),
-      );
-      if (btn && btn.offsetParent !== null && !btn.disabled) {
+// to wait for a carrier row to finish and expose "View plan summary".
+
+// Find (and optionally click) a visible, enabled button in a premiums row
+// whose label matches textRe. carrier limits it to that carrier's row;
+// excludeCarrier skips that carrier's row.
+async function rowButton(
+  page,
+  textRe,
+  { carrier = null, excludeCarrier = null, click = true } = {},
+) {
+  return page.evaluate(
+    (reSrc, carrier, exclude, click) => {
+      const re = new RegExp(reSrc, "i");
+      const norm = (s) => (s || "").toLowerCase();
+      for (const row of document.querySelectorAll("table.table tbody tr")) {
+        const t = norm(row.innerText);
+        if (carrier && !t.includes(norm(carrier))) continue;
+        if (exclude && t.includes(norm(exclude))) continue;
+        const btn = Array.from(
+          row.querySelectorAll("button, a, .o-btn, span"),
+        ).find(
+          (b) =>
+            re.test((b.textContent || "").trim()) &&
+            b.offsetParent !== null &&
+            !b.disabled,
+        );
+        if (!btn) continue;
+        if (click) {
+          btn.scrollIntoView({ block: "center" });
+          btn.click();
+        }
+        return true;
+      }
+      return false;
+    },
+    textRe.source,
+    carrier,
+    excludeCarrier,
+    click,
+  );
+}
+
+const SUMMARY_RE = /^view\s*plan\s*summary$/;
+const RATE_RE = /^rate$/;
+const REVIEW_RE = /^review$/;
+
+async function findAndOpenPlanSummary(page, carrier = null) {
+  return rowButton(page, SUMMARY_RE, { carrier });
+}
+
+async function goToTab(page, name) {
+  await page.click(`.tabs__list .tabs__item a[href*="${name}"]`);
+  await sleep(1500);
+}
+
+// Clear + type into a datepicker input; returns true if a full date stuck
+async function setDateInput(page, sel, mmddyyyy) {
+  await page.waitForSelector(sel, { visible: true, timeout: 10000 });
+  await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
+  await page.click(sel, { clickCount: 3 }).catch(() => {});
+  for (let i = 0; i < 12; i++) await page.keyboard.press("Backspace");
+  await page.keyboard.type(mmddyyyy, { delay: 100 });
+  await page.keyboard.press("Tab");
+  await sleep(300);
+  return page
+    .$eval(sel, (el) => (el.value || "").replace(/\D/g, "").length >= 8)
+    .catch(() => false);
+}
+
+// Clear + type into a plain text input and fire input/change events
+async function setTextInput(page, sel, value) {
+  await page.waitForSelector(sel, { visible: true, timeout: 10000 });
+  await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
+  await page.click(sel, { clickCount: 3 }).catch(() => {});
+  await page.keyboard.press("Backspace");
+  await page.keyboard.type(String(value), { delay: 100 });
+  await page.evaluate(
+    (s, v) => {
+      const el = document.querySelector(s);
+      if (!el) return;
+      el.value = v;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    },
+    sel,
+    String(value),
+  );
+  await page.keyboard.press("Tab");
+  await sleep(300);
+}
+
+async function clickRateAllPlans(page) {
+  await page.waitForFunction(
+    () =>
+      Array.from(document.querySelectorAll("a.o-btn")).some(
+        (b) =>
+          (b.textContent || "").trim().toLowerCase() === "rate all plans" &&
+          b.offsetParent !== null,
+      ),
+    { timeout: 15000 },
+  );
+  const handle = await page.evaluateHandle(() =>
+    Array.from(document.querySelectorAll("a.o-btn")).find(
+      (a) =>
+        (a.textContent || "").replace(/\s+/g, " ").trim().toLowerCase() ===
+          "rate all plans" && a.offsetParent !== null,
+    ),
+  );
+  const el = handle.asElement();
+  if (!el) throw new Error('Could not find "Rate All Plans"');
+  await el.evaluate((a) => a.scrollIntoView({ block: "center" }));
+  await el.click();
+}
+
+// Snapshot of each premiums row: carrier text + visible button labels
+async function getPremiumRowStates(page) {
+  return page.evaluate(() =>
+    Array.from(document.querySelectorAll("table.table tbody tr")).map(
+      (row) => ({
+        text: (row.innerText || "").replace(/\s+/g, " ").trim().slice(0, 150),
+        buttons: Array.from(row.querySelectorAll("button, a.o-btn"))
+          .filter((b) => b.offsetParent !== null)
+          .map(
+            (b) =>
+              (b.textContent || "").trim() + (b.disabled ? " (disabled)" : ""),
+          ),
+      }),
+    ),
+  );
+}
+
+// Poll until the premiums table stops changing (every row settled on
+// Summary/Review/Rate/Error). Returns early once one of `carriers` (or any
+// row, if null) exposes "View plan summary". Does not click anything.
+async function waitForRatingSettled(page, carriers = null, maxMs = 180000) {
+  const start = Date.now();
+  let lastSig = "";
+  let stableCount = 0;
+  while (Date.now() - start < maxMs) {
+    await sleep(5000);
+    for (const carrier of carriers || [null]) {
+      if (await rowButton(page, SUMMARY_RE, { carrier, click: false }))
+        return true;
+    }
+    const sig = JSON.stringify(await getPremiumRowStates(page).catch(() => []));
+    stableCount = sig === lastSig ? stableCount + 1 : 0;
+    lastSig = sig;
+    if (Date.now() - start > 30000 && stableCount >= 4) return false;
+  }
+  return false;
+}
+
+// Open each row's "Review" modal, collect the warning lines, close it.
+const REVIEW_MODAL_SEL =
+  '.modalbox__content, .modalbox, [role="dialog"], .sm-popup.is-active';
+
+async function collectReviewWarnings(page, carrier = null) {
+  const rowCount = await page.$$eval("table.table tbody tr", (r) => r.length);
+  const warnings = new Set();
+
+  for (let i = 0; i < rowCount; i++) {
+    const opened = await page.evaluate(
+      (idx, carrier) => {
+        const row = document.querySelectorAll("table.table tbody tr")[idx];
+        if (!row) return false;
+        if (
+          carrier &&
+          !(row.innerText || "").toLowerCase().includes(carrier.toLowerCase())
+        )
+          return false;
+        const btn = Array.from(
+          row.querySelectorAll("button, a, .o-btn, span"),
+        ).find(
+          (b) =>
+            /^\s*review\s*$/i.test(b.textContent || "") &&
+            b.offsetParent !== null,
+        );
+        if (!btn) return false;
         btn.scrollIntoView({ block: "center" });
         btn.click();
         return true;
-      }
-    }
-    return false;
-  });
+      },
+      i,
+      carrier,
+    );
+    if (!opened) continue;
+
+    const found = await page
+      .waitForFunction(
+        (sel) =>
+          Array.from(document.querySelectorAll(sel)).some(
+            (m) =>
+              m.getClientRects().length &&
+              /review warnings/i.test(m.innerText || ""),
+          ),
+        { timeout: 10000 },
+        REVIEW_MODAL_SEL,
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (!found) continue;
+
+    const lines = await page.evaluate((sel) => {
+      const modal = Array.from(document.querySelectorAll(sel))
+        .filter(
+          (m) =>
+            m.getClientRects().length &&
+            /review warnings/i.test(m.innerText || ""),
+        )
+        .pop();
+      if (!modal) return [];
+      const links = Array.from(modal.querySelectorAll("a"))
+        .map((a) => (a.textContent || "").trim())
+        .filter(Boolean);
+      if (links.length) return links;
+      return (modal.innerText || "")
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(
+          (s) =>
+            s &&
+            !/^(review warnings|this plan cannot be rated|.*requires:$|resolve warnings$|close$)/i.test(
+              s,
+            ),
+        );
+    }, REVIEW_MODAL_SEL);
+    lines.forEach((l) => warnings.add(l));
+
+    // close the modal
+    await page.evaluate((sel) => {
+      const modal = Array.from(document.querySelectorAll(sel))
+        .filter(
+          (m) =>
+            m.getClientRects().length &&
+            /review warnings/i.test(m.innerText || ""),
+        )
+        .pop();
+      const close =
+        modal &&
+        Array.from(modal.querySelectorAll("button, a")).find((b) =>
+          /^\s*close\s*$/i.test(b.textContent || ""),
+        );
+      if (close) close.click();
+    }, REVIEW_MODAL_SEL);
+    await page
+      .waitForFunction(
+        (sel) =>
+          !Array.from(document.querySelectorAll(sel)).some(
+            (m) =>
+              m.getClientRects().length &&
+              /review warnings/i.test(m.innerText || ""),
+          ),
+        { timeout: 5000 },
+        REVIEW_MODAL_SEL,
+      )
+      .catch(() => {});
+    await sleep(500);
+  }
+
+  return Array.from(warnings);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -517,6 +761,28 @@ const city = String(
 const state = String($json.body?.state || "").trim();
 const zip = String($json.body?.zip || vehicleZip).trim();
 const email = String($json.body?.email || "").trim();
+
+// Vehicle garaging zip: fall back to the client zip when v1_zip is missing
+// (that empty value is what produced "Zip Code not set for <vehicle>").
+const locationZip = vehicleZip || zip;
+
+// First Licensed is required by every carrier. When the webhook doesn't
+// send d1_lic_date, assume DOB + 18 years (capped at today) so rating can
+// proceed — the quote will reflect that assumption.
+function deriveFirstLicenseDate(dob) {
+  const d = new Date(dob);
+  if (isNaN(d.getTime())) return "";
+  d.setFullYear(d.getFullYear() + 18);
+  const now = new Date();
+  const use = d > now ? now : d;
+  return `${use.getMonth() + 1}/${use.getDate()}/${use.getFullYear()}`;
+}
+const effectiveFirstLicenseDate =
+  firstLicenseDate || deriveFirstLicenseDate(dobRaw);
+if (!firstLicenseDate)
+  console.warn(
+    `d1_lic_date missing — using derived First Licensed date ${effectiveFirstLicenseDate}`,
+  );
 
 if (!licenseNo) throw new Error("Missing d1_lic_num in input JSON");
 
@@ -699,13 +965,12 @@ if (isRmvFlow) {
   await $page.keyboard.type("Insured", { delay: 100 });
   await $page.keyboard.press("Tab");
 
-  if (firstLicenseDate) {
-    await $page.type(
+  if (effectiveFirstLicenseDate) {
+    await setDateInput(
+      $page,
       "#driverFirstLicensed",
-      formatDateToMMDDYYYY(firstLicenseDate),
-      { delay: 100 },
+      formatDateToMMDDYYYY(effectiveFirstLicenseDate),
     );
-    await $page.keyboard.press("Tab");
   }
 
   await $page.waitForSelector("#driverSdip", { visible: true, timeout: 5000 });
@@ -743,13 +1008,12 @@ if (isRmvFlow) {
   await $page.keyboard.type("Insured", { delay: 100 });
   await $page.keyboard.press("Tab");
 
-  if (firstLicenseDate) {
-    await $page.type(
+  if (effectiveFirstLicenseDate) {
+    await setDateInput(
+      $page,
       "#driverFirstLicensed",
-      formatDateToMMDDYYYY(firstLicenseDate),
-      { delay: 100 },
+      formatDateToMMDDYYYY(effectiveFirstLicenseDate),
     );
-    await $page.keyboard.press("Tab");
   }
 
   await $page.focus("#driverLicenseNumber");
@@ -886,14 +1150,14 @@ await $page.keyboard.type(city, { delay: 100 });
 await $page.waitForSelector("#vehicleLocationZip", { timeout: 10000 });
 await $page.click("#vehicleLocationZip", { clickCount: 3 });
 await $page.keyboard.press("Backspace");
-await $page.keyboard.type(vehicleZip, { delay: 100 });
+await $page.keyboard.type(locationZip, { delay: 100 });
 await $page.evaluate((v) => {
   const input = document.querySelector("#vehicleLocationZip");
   if (!input) return;
   input.value = v;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-}, vehicleZip);
+}, locationZip);
 
 await $page.waitForSelector("#vehicleAnnualMiles", { timeout: 10000 });
 await $page.click("#vehicleAnnualMiles", { clickCount: 3 });
@@ -999,54 +1263,138 @@ await $page.$eval("button.app-button.app-button--save-quote", (el) =>
 await $page.click("button.app-button.app-button--save-quote", { delay: 50 });
 await sleep(2000);
 
-// Wait until "Rate All Plans" button is visible then click
-await $page.waitForFunction(
-  () => {
-    const btns = Array.from(document.querySelectorAll("a.o-btn"));
-    return btns.some(
-      (b) =>
-        (b.textContent || "").trim().toLowerCase() === "rate all plans" &&
-        b.offsetParent !== null,
-    );
+// Each known Review warning maps to a fix on the right tab. Add a new entry
+// here whenever a run fails with an "Unhandled review warnings" error.
+const REVIEW_FIXERS = [
+  {
+    match: /first licensed date required/i,
+    fix: async (page) => {
+      if (!effectiveFirstLicenseDate) return false;
+      await goToTab(page, "drivers");
+      return setDateInput(
+        page,
+        "#driverFirstLicensed",
+        formatDateToMMDDYYYY(effectiveFirstLicenseDate),
+      );
+    },
   },
-  { timeout: 15000 },
-);
+  {
+    match: /zip code not set/i,
+    fix: async (page) => {
+      if (!locationZip) return false;
+      await goToTab(page, "vehicles");
+      await setTextInput(page, "#vehicleLocationZip", locationZip);
+      return true;
+    },
+  },
+];
 
-const rateAllClicked = await $page.evaluate(() => {
-  const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-  const target = Array.from(document.querySelectorAll("a.o-btn")).find(
-    (a) => norm(a.textContent) === "rate all plans" && a.offsetParent !== null,
+// Rate All → open a plan summary: MAPFRE first, then MAIP (CAR), then any
+// other rated plan. If every plan lands on Review: resolve Arbella's
+// warnings, then rate Arbella. If after that Arbella is still in Review but
+// another plan shows "Rate", rate and use that plan instead.
+const SUMMARY_PRIORITY = ["MAPFRE", "MAIP"];
+const PREFERRED_CARRIER = "Arbella";
+const MAX_RATE_ROUNDS = 8;
+const fixedWarnings = new Set();
+let summaryOpened = false;
+let summaryCarrier = null;
+let preferredResolveTried = false;
+
+await clickRateAllPlans($page);
+console.log("Rate All Plans clicked");
+await waitForRatingSettled($page, SUMMARY_PRIORITY);
+
+for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
+  // 1. A rated plan is available → open it (MAPFRE, MAIP, then any other)
+  for (const carrier of SUMMARY_PRIORITY) {
+    if (await findAndOpenPlanSummary($page, carrier)) {
+      summaryOpened = true;
+      summaryCarrier = carrier;
+      break;
+    }
+  }
+  if (summaryOpened) break;
+  if (await findAndOpenPlanSummary($page)) {
+    summaryOpened = true;
+    break;
+  }
+
+  // 2. Arbella is ready to rate → rate it
+  if (await rowButton($page, RATE_RE, { carrier: PREFERRED_CARRIER })) {
+    console.log(`Rating ${PREFERRED_CARRIER} (round ${round})`);
+    await waitForRatingSettled($page, [PREFERRED_CARRIER]);
+    continue;
+  }
+
+  // 3. Arbella is stuck (still Review after resolving, or Error) and some
+  //    other plan is ready to rate → rate that one
+  const preferredInReview = await rowButton($page, REVIEW_RE, {
+    carrier: PREFERRED_CARRIER,
+    click: false,
+  });
+  if (
+    (!preferredInReview || preferredResolveTried) &&
+    (await rowButton($page, RATE_RE, { excludeCarrier: PREFERRED_CARRIER }))
+  ) {
+    console.log(
+      `${PREFERRED_CARRIER} not ratable — rating another plan (round ${round})`,
+    );
+    await waitForRatingSettled($page);
+    continue;
+  }
+
+  // 4. Resolve Review warnings: Arbella's if it's in Review, else every row's
+  const reviewTarget = preferredInReview ? PREFERRED_CARRIER : null;
+  if (preferredInReview) preferredResolveTried = true;
+  const warnings = await collectReviewWarnings($page, reviewTarget);
+  console.log(
+    `Review warnings for ${reviewTarget || "all plans"} (round ${round}):`,
+    warnings,
   );
-  if (!target) return false;
-  target.scrollIntoView({ block: "center" });
-  const opts = { bubbles: true, cancelable: true };
-  target.dispatchEvent(new MouseEvent("mouseover", opts));
-  target.dispatchEvent(new MouseEvent("mousedown", opts));
-  target.dispatchEvent(new MouseEvent("mouseup", opts));
-  target.dispatchEvent(new MouseEvent("click", opts));
-  return true;
-});
-if (!rateAllClicked) throw new Error('Could not click "Rate All Plans"');
 
-// Give the site time to actually rate every carrier before we go looking
-// for results. 30s covers the normal case; we still poll a bit past that
-// as a safety margin rather than failing the instant 30s is up.
-await sleep(30000);
+  if (!warnings.length) {
+    const states = await getPremiumRowStates($page).catch(() => []);
+    throw new Error(
+      `No 'View Plan Summary' and no Review warnings found. Row states: ${JSON.stringify(states)}`,
+    );
+  }
 
-await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
+  const unhandled = [];
+  for (const w of warnings) {
+    const fixer = REVIEW_FIXERS.find((f) => f.match.test(w));
+    if (!fixer) {
+      unhandled.push(w);
+      continue;
+    }
+    if (fixedWarnings.has(w)) {
+      unhandled.push(`${w} (still present after fixing)`);
+      continue;
+    }
+    const ok = await fixer.fix($page).catch((e) => {
+      console.warn(`Fixer failed for "${w}":`, e.message);
+      return false;
+    });
+    if (ok) fixedWarnings.add(w);
+    else unhandled.push(`${w} (no data to fix it)`);
+  }
 
-let summaryOpened = await findAndOpenPlanSummary($page);
-// Some carriers post their premium slower than others. Retry a few more
-// times (5s apart, ~30s extra) before giving up, instead of a single
-// all-or-nothing check right at the 30s mark.
-for (let attempt = 0; attempt < 6 && !summaryOpened; attempt++) {
-  await sleep(5000);
-  summaryOpened = await findAndOpenPlanSummary($page);
+  if (unhandled.length) {
+    throw new Error(
+      `Unhandled review warnings — add a fixer in REVIEW_FIXERS: ${JSON.stringify(unhandled)}`,
+    );
+  }
+
+  // back to Premiums; the next round rates whatever is now ratable
+  await goToTab($page, "premiums");
+  await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
+  await sleep(2000);
 }
 
 if (!summaryOpened) {
+  const states = await getPremiumRowStates($page).catch(() => []);
   throw new Error(
-    "No plan row with a 'View Plan Summary' button was found after ~60s of waiting. This means rating either hasn't finished, failed outright, or every carrier landed on 'Review'/'Error' instead of a summary (MAIP (CAR) and MAPFRE never expose 'View Plan Summary' — that's expected, not a bug).",
+    `No 'View Plan Summary' after ${MAX_RATE_ROUNDS} rate rounds. Row states: ${JSON.stringify(states)}`,
   );
 }
 await sleep(3000);
@@ -1111,7 +1459,7 @@ for (let attempt = 0; attempt < 3 && !printLauncherFound; attempt++) {
     console.warn(
       `#tooltipLauncherPrint not found (attempt ${attempt + 1}/3), retrying plan summary...`,
     );
-    await findAndOpenPlanSummary($page).catch(() => {});
+    await findAndOpenPlanSummary($page, summaryCarrier).catch(() => {});
     await sleep(3000);
   }
 }
