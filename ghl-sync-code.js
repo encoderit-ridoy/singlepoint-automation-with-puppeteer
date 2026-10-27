@@ -252,6 +252,12 @@ if (isDoNotMarket) {
   ghlContact.dnd = true;
 }
 
+// HawkSoft source "Cross Sell" -> do-not-xsell tag
+const hawksoftSource = cleanString(safeGet(details, "source", ""));
+if (hawksoftSource.toLowerCase().replace(/[\s_-]+/g, "") === "crosssell") {
+  ghlContact.tags.push("do-not-xsell");
+}
+
 // ============================================================
 // BASIC CUSTOM FIELDS
 // ============================================================
