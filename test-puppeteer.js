@@ -295,6 +295,12 @@ async function ensureChecked(page, baseId) {
     el.scrollIntoView({ block: "center", inline: "center" }),
   );
 
+  // Already checked → clicking would toggle it OFF, so leave it alone
+  const already = await page
+    .$eval(SEL_INPUT, (el) => !!el.checked)
+    .catch(() => false);
+  if (already) return false;
+
   // try icon click first
   try {
     await page.waitForSelector(SEL_ICON, { timeout: 2000 });
@@ -338,6 +344,88 @@ async function ensureChecked(page, baseId) {
         await sleep(150);
       }
     }
+  }
+  return true;
+}
+
+// Answers for known required Options items (matched by item title).
+// Anything not listed here gets the first radio in its modal.
+const REQUIRED_OPTION_ANSWERS = [
+  { match: /length of time for continuous coverage/i, answer: /36\s*\+\s*months?/, fallback: "last" },
+  { match: /travelers.*continuous insurance/i, answer: /less\s+than\s+3\s+years?/, fallback: "first" },
+  { match: /travelers.*primary residence type/i, answer: /^other$/, fallback: "first" },
+];
+
+// Find Options items shown in red (required) that are still unchecked.
+// Returns [{ baseId, title }]. Red is detected from the computed text color,
+// so it works no matter which carriers/items a given client shows.
+async function findRequiredUncheckedOptions(page) {
+  return page.evaluate(() => {
+    const isRed = (el) => {
+      const m = getComputedStyle(el).color.match(/\d+/g);
+      if (!m) return false;
+      const [r, g, b] = m.map(Number);
+      return r > 150 && g < 110 && b < 110;
+    };
+    const out = [];
+    for (const input of document.querySelectorAll('input[id$="_checkbox"]')) {
+      if (input.checked || input.disabled) continue;
+      const baseId = input.id.replace(/_checkbox$/, "");
+      const item = document.getElementById(baseId);
+      if (!item) continue;
+      const textEls = Array.from(item.querySelectorAll("*")).filter((el) =>
+        Array.from(el.childNodes).some(
+          (n) => n.nodeType === 3 && n.textContent.trim(),
+        ),
+      );
+      if (!textEls.some(isRed)) continue;
+      const title = (item.innerText || "").split("\n")[0].trim();
+      out.push({ baseId, title });
+    }
+    return out;
+  });
+}
+
+// Check every red/required Options item and answer its modal if one opens.
+async function handleRequiredOptions(page) {
+  const attempts = {};
+  for (let round = 0; round < 10; round++) {
+    const pending = (await findRequiredUncheckedOptions(page)).filter(
+      (o) => (attempts[o.baseId] || 0) < 2,
+    );
+    if (!pending.length) break;
+
+    for (const { baseId, title } of pending) {
+      attempts[baseId] = (attempts[baseId] || 0) + 1;
+      console.log(`Options: required item → ${title || baseId}`);
+      try {
+        await ensureChecked(page, baseId);
+
+        const hasModal = await page
+          .waitForSelector('label.o-checkable input[name="parsedItemOption"]', {
+            timeout: 4000,
+          })
+          .then(() => true)
+          .catch(() => false);
+
+        if (hasModal) {
+          const rule = REQUIRED_OPTION_ANSWERS.find((r) => r.match.test(title));
+          await pickModalRadio(page, rule ? rule.answer : /(?!)/, rule ? rule.fallback : "first");
+          await saveModal(page);
+        }
+        await sleep(500);
+      } catch (e) {
+        console.warn(`Options: could not handle "${title}": ${e.message}`);
+      }
+    }
+  }
+
+  const left = await findRequiredUncheckedOptions(page);
+  if (left.length) {
+    console.warn(
+      "Options: still required/unchecked →",
+      left.map((o) => o.title || o.baseId).join(", "),
+    );
   }
 }
 
@@ -761,6 +849,11 @@ const city = String(
 const state = String($json.body?.state || "").trim();
 const zip = String($json.body?.zip || vehicleZip).trim();
 const email = String($json.body?.email || "").trim();
+const agentCode = String($json.body?.agent_code || $json.agent_code || "")
+  .trim()
+  .toUpperCase();
+// Agent JRN always wants a MAIP plan; others keep the default priority.
+const IS_JRN = agentCode === "JRN";
 
 // Vehicle garaging zip: fall back to the client zip when v1_zip is missing
 // (that empty value is what produced "Zip Code not set for <vehicle>").
@@ -1228,23 +1321,10 @@ await $page.keyboard.type("100/300", { delay: 100 });
 await $page.keyboard.press("Tab");
 await sleep(1000);
 
-// ── 6A. MAPFRE — Length of Time for Continuous Coverage ──
-await ensureChecked(
-  $page,
-  "BSC-AUTO-002400_MAPFRELengthofTimeforContinuousCoverage",
-);
-await pickModalRadio($page, /36\s*\+\s*months?/, "last");
-await saveModal($page);
-
-// ── 6B. Travelers — Continuous Insurance ─────────────────
-await ensureChecked($page, "BSC-AUTO-002195_TravelersContinuousInsurance");
-await pickModalRadio($page, /less\s+than\s+3\s+years?/, "first");
-await saveModal($page);
-
-// ── 6C. Travelers — Primary Residence Type ───────────────
-await ensureChecked($page, "BSC-AUTO-002152_TravelersPrimaryResidenceType");
-await pickModalRadio($page, /^other$/, "first");
-await saveModal($page);
+// ── 6A. Required (red) option items ──────────────────────
+// Different clients show different carriers/items, and some are already
+// checked. Detect whatever is red + unchecked and handle only those.
+await handleRequiredOptions($page);
 // ─────────────────────────────────────────────────────────────
 //  7.  PREMIUMS TAB
 // ─────────────────────────────────────────────────────────────
@@ -1301,9 +1381,79 @@ let summaryOpened = false;
 let summaryCarrier = null;
 let preferredResolveTried = false;
 
+// Run REVIEW_FIXERS over a list of warnings; returns the ones it couldn't fix.
+async function applyReviewFixers(page, warnings) {
+  const unhandled = [];
+  for (const w of warnings) {
+    const fixer = REVIEW_FIXERS.find((f) => f.match.test(w));
+    if (!fixer) {
+      unhandled.push(w);
+      continue;
+    }
+    if (fixedWarnings.has(w)) {
+      unhandled.push(`${w} (still present after fixing)`);
+      continue;
+    }
+    const ok = await fixer.fix(page).catch((e) => {
+      console.warn(`Fixer failed for "${w}":`, e.message);
+      return false;
+    });
+    if (ok) fixedWarnings.add(w);
+    else unhandled.push(`${w} (no data to fix it)`);
+  }
+  return unhandled;
+}
+
 await clickRateAllPlans($page);
 console.log("Rate All Plans clicked");
-await waitForRatingSettled($page, SUMMARY_PRIORITY);
+await waitForRatingSettled($page, IS_JRN ? ["MAIP"] : SUMMARY_PRIORITY);
+
+// Agent JRN: try hard to get MAIP (rate it / resolve its Review warnings).
+// If MAIP can't be rated or its warnings can't be resolved, fall through to
+// the normal flow below, which picks another plan.
+if (IS_JRN) {
+  const MAIP = "MAIP";
+  for (let round = 1; round <= MAX_RATE_ROUNDS; round++) {
+    if (await findAndOpenPlanSummary($page, MAIP)) {
+      summaryOpened = true;
+      summaryCarrier = MAIP;
+      console.log("JRN: MAIP plan summary opened");
+      break;
+    }
+
+    if (await rowButton($page, RATE_RE, { carrier: MAIP })) {
+      console.log(`JRN: rating MAIP (round ${round})`);
+      await waitForRatingSettled($page, [MAIP]);
+      continue;
+    }
+
+    const maipInReview = await rowButton($page, REVIEW_RE, {
+      carrier: MAIP,
+      click: false,
+    });
+    if (!maipInReview) {
+      console.warn("JRN: MAIP is not ratable (no Rate/Review) — using another plan");
+      break;
+    }
+
+    const warnings = await collectReviewWarnings($page, MAIP);
+    console.log(`JRN: MAIP review warnings (round ${round}):`, warnings);
+    const unhandled = warnings.length
+      ? await applyReviewFixers($page, warnings)
+      : ["(no warnings found)"];
+    if (unhandled.length) {
+      console.warn(
+        "JRN: can't resolve MAIP warnings — using another plan:",
+        unhandled,
+      );
+      break;
+    }
+
+    await goToTab($page, "premiums");
+    await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
+    await sleep(2000);
+  }
+}
 
 for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
   // 1. A rated plan is available → open it (MAPFRE, MAIP, then any other)
@@ -1360,24 +1510,7 @@ for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
     );
   }
 
-  const unhandled = [];
-  for (const w of warnings) {
-    const fixer = REVIEW_FIXERS.find((f) => f.match.test(w));
-    if (!fixer) {
-      unhandled.push(w);
-      continue;
-    }
-    if (fixedWarnings.has(w)) {
-      unhandled.push(`${w} (still present after fixing)`);
-      continue;
-    }
-    const ok = await fixer.fix($page).catch((e) => {
-      console.warn(`Fixer failed for "${w}":`, e.message);
-      return false;
-    });
-    if (ok) fixedWarnings.add(w);
-    else unhandled.push(`${w} (no data to fix it)`);
-  }
+  const unhandled = await applyReviewFixers($page, warnings);
 
   if (unhandled.length) {
     throw new Error(
