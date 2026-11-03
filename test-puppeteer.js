@@ -25,6 +25,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function formatDateToMMDDYYYY(dateStr) {
   if (!dateStr) return "";
+  // "YYYY-MM-DD" is parsed by Date as UTC midnight, which shifts to the
+  // previous day on servers west of UTC — read the parts directly instead.
+  const iso = String(dateStr).match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) {
+    return `${iso[2].padStart(2, "0")}${iso[3].padStart(2, "0")}${iso[1]}`;
+  }
   const date = new Date(dateStr);
   if (isNaN(date.getTime())) return "";
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -207,6 +213,167 @@ async function selectFirstAvailableOption(page, inputSel) {
   });
   await page.keyboard.press("Tab").catch(() => {});
   return picked;
+}
+
+// Pick an option from a select-like dropdown: the first option whose text
+// contains `prefer` (e.g. "sedan"), else the first option. Waits for the
+// options to load (trims load async after model) and verifies the input
+// ended up with a value. Returns the input's final value ("" = failed).
+async function selectOptionPreferring(page, inputSel, prefer = "") {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await openSelectLike(page, inputSel);
+    await sleep(800 + attempt * 700);
+    const picked = await page.evaluate(
+      (s, prefer) => {
+        const host = document.querySelector(s);
+        const sels = [
+          ".sm-input-select__menu .sm-input-select__option",
+          ".autocomplete__menu .autocomplete__item",
+          ".autocomplete__list li",
+          ".ng-dropdown-panel .ng-option",
+          ".mat-select-panel .mat-option",
+          '.cdk-overlay-container [role="option"]',
+          '[role="listbox"] [role="option"]',
+          '[role="option"]',
+          ".dropdown-menu .dropdown-item",
+        ];
+        const visible = (n) => !!(n.offsetParent || n.getClientRects().length);
+        // options inside the input's own wrapper first, then global overlays
+        const root =
+          host?.closest(".sm-input-select,.autocomplete,.ng-select,.mat-select,.dropdown") ||
+          null;
+        for (const scope of [root, document].filter(Boolean)) {
+          for (const sel of sels) {
+            const opts = Array.from(scope.querySelectorAll(sel)).filter(
+              (n) => visible(n) && (n.textContent || "").trim(),
+            );
+            if (!opts.length) continue;
+            const p = (prefer || "").toLowerCase();
+            const hit =
+              (p && opts.find((n) => n.textContent.toLowerCase().includes(p))) ||
+              opts[0];
+            hit.scrollIntoView({ block: "center" });
+            hit.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+            hit.click();
+            return (hit.textContent || "").trim();
+          }
+        }
+        return "";
+      },
+      inputSel,
+      prefer,
+    );
+    await page.keyboard.press("Tab").catch(() => {});
+    await sleep(600);
+    const value = await page
+      .$eval(inputSel, (el) => (el.value || "").trim())
+      .catch(() => "");
+    console.log(
+      `selectOptionPreferring ${inputSel}: picked "${picked}", value now "${value}"`,
+    );
+    if (value) return value;
+  }
+  return "";
+}
+
+// Find a visible date-of-birth input inside the element matching rootSel
+// (by id/name/placeholder or by its label text). Tags it with
+// data-dob-target and returns a selector for it, or null.
+async function findDobInput(page, rootSel = "body") {
+  return page.evaluate((rootSel) => {
+    // never fall back to the whole page — it would grab the driver DOB field
+    const root = document.querySelector(rootSel);
+    if (!root) return null;
+    const visible = (n) => !!(n.offsetParent || n.getClientRects().length);
+    const re = /birth|\bdob\b/i;
+    const inputs = Array.from(root.querySelectorAll("input")).filter(visible);
+    let target = inputs.find((i) =>
+      re.test(`${i.id} ${i.name} ${i.placeholder} ${i.getAttribute("aria-label") || ""}`),
+    );
+    if (!target) {
+      for (const lbl of root.querySelectorAll("label, .o-label, th, td, span, div")) {
+        if (lbl.children.length > 3) continue;
+        if (!re.test(lbl.textContent || "")) continue;
+        const forId = lbl.getAttribute && lbl.getAttribute("for");
+        const cand =
+          (forId && document.getElementById(forId)) ||
+          lbl.querySelector("input") ||
+          lbl.parentElement?.querySelector("input") ||
+          lbl.closest("tr")?.querySelector("input");
+        if (cand && visible(cand)) {
+          target = cand;
+          break;
+        }
+      }
+    }
+    if (!target) return null;
+    document
+      .querySelectorAll("[data-dob-target]")
+      .forEach((n) => n.removeAttribute("data-dob-target"));
+    target.setAttribute("data-dob-target", "1");
+    return "[data-dob-target]";
+  }, rootSel);
+}
+
+// Open the "Client:" box edit form, set client DOB, click "Update info".
+async function setClientDob(page, mmddyyyy) {
+  const opened = await page.evaluate(() => {
+    const box = Array.from(document.querySelectorAll(".aboutbox")).find(
+      (b) => b.querySelector(".aboutbox__title")?.textContent.trim() === "Client:",
+    );
+    const link = box?.querySelector("a.aboutbox__link");
+    if (!link) return false;
+    link.scrollIntoView({ block: "center" });
+    link.click();
+    return true;
+  });
+  if (!opened) return false;
+  await page
+    .waitForSelector("#clientInfoAddrZip_StreetAddress", { timeout: 10000 })
+    .catch(() => {});
+  await sleep(500);
+  const ok = await fillClientDobInOpenForm(page, mmddyyyy);
+  await clickUpdateInfo(page);
+  return ok;
+}
+
+// With the client info form already open, fill its DOB field.
+async function fillClientDobInOpenForm(page, mmddyyyy) {
+  if (!mmddyyyy) return false;
+  // scope to the form/modal that holds the client address fields
+  await page.evaluate(() => {
+    document
+      .querySelectorAll("[data-client-form]")
+      .forEach((n) => n.removeAttribute("data-client-form"));
+    const zip = document.querySelector("#clientInfoAddrZip_StreetAddress");
+    const root =
+      zip?.closest(".modalbox__content, .modalbox, [role='dialog'], .sm-popup, form") ||
+      null;
+    if (root) root.setAttribute("data-client-form", "1");
+  });
+  const sel =
+    (await page.$("#clientInfoDateOfBirth").then((h) => (h ? "#clientInfoDateOfBirth" : null))) ||
+    (await findDobInput(page, "[data-client-form]"));
+  if (!sel) {
+    console.warn("Client DOB input not found in client info form");
+    return false;
+  }
+  const ok = await setDateInput(page, sel, mmddyyyy);
+  console.log(`Client DOB (${sel}) set: ${ok}`);
+  return ok;
+}
+
+async function clickUpdateInfo(page) {
+  await page.evaluate(() => {
+    const btn = Array.from(document.querySelectorAll("button.o-btn")).find(
+      (b) => b.textContent.trim() === "Update info",
+    );
+    if (btn) {
+      btn.scrollIntoView({ block: "center" });
+      btn.click();
+    }
+  });
+  await sleep(3000);
 }
 
 // Robustly fill an autocomplete that is just a number (e.g. yearsWithThisCarrier)
@@ -590,6 +757,46 @@ async function goToTab(page, name) {
   await sleep(1500);
 }
 
+// Debug snapshot of a tab: URL, open modals, and every visible input /
+// select with its id, name, label text and current value. Used to find the
+// real selectors when a fixer can't find or set a field.
+async function describeTab(page, name) {
+  await goToTab(page, name);
+  await sleep(1000);
+  return page.evaluate(() => {
+    const visible = (n) => !!(n.offsetParent || n.getClientRects().length);
+    const labelOf = (el) => {
+      const byFor = el.id && document.querySelector(`label[for="${el.id}"]`);
+      const t =
+        byFor?.textContent ||
+        el.closest("label")?.textContent ||
+        el.closest(".o-field, .form-group, tr, .row, div")?.querySelector("label, .o-label, th")
+          ?.textContent ||
+        "";
+      return t.replace(/\s+/g, " ").trim().slice(0, 60);
+    };
+    return {
+      url: location.href,
+      modals: Array.from(
+        document.querySelectorAll('.modalbox__content, [role="dialog"], .sm-popup.is-active'),
+      )
+        .filter(visible)
+        .map((m) => (m.innerText || "").replace(/\s+/g, " ").slice(0, 120)),
+      fields: Array.from(document.querySelectorAll("input, select, textarea"))
+        .filter((el) => visible(el) && el.type !== "hidden")
+        .slice(0, 80)
+        .map((el) => ({
+          id: el.id || undefined,
+          name: el.name || undefined,
+          cls: (el.className || "").toString().slice(0, 50) || undefined,
+          label: labelOf(el) || undefined,
+          value: el.type === "checkbox" ? el.checked : (el.value || "").slice(0, 40),
+          disabled: el.disabled || undefined,
+        })),
+    };
+  });
+}
+
 // Clear + type into a datepicker input; returns true if a full date stuck
 async function setDateInput(page, sel, mmddyyyy) {
   await page.waitForSelector(sel, { visible: true, timeout: 10000 });
@@ -841,6 +1048,7 @@ const vehicleModel = String($json.body?.v1_model || "OUTBACK").trim();
 const vehicleTrim = String(
   $json.body?.v1_trim || $json.body?.step_5_reg_type_1 || "",
 ).trim();
+const vehicleBody = String($json.body?.v1_body || "").trim(); // e.g. "Sedan"
 const vehicleZip = String($json.body?.v1_zip || "").trim();
 const address1 = String($json.body?.residential_address || "").trim();
 const city = String(
@@ -1089,9 +1297,8 @@ if (isRmvFlow) {
   await sleep(100);
 
   const dobFormatted = formatDateToMMDDYYYY(dobRaw);
-  await $page.click("#driverDateOfBirth", { clickCount: 3 });
-  await $page.keyboard.type(dobFormatted, { delay: 150 });
-  await $page.keyboard.press("Tab");
+  const dobOk = await setDateInput($page, "#driverDateOfBirth", dobFormatted);
+  if (!dobOk) console.warn(`Driver DOB did not stick (${dobFormatted})`);
 
   await $page.waitForSelector("#driverRelationshipToInsured", {
     timeout: 10000,
@@ -1168,6 +1375,11 @@ if (isRmvFlow) {
   await $page.keyboard.press("Backspace");
   await $page.keyboard.type(zip, { delay: 100 });
 
+  // Client DOB (otherwise: "Required Date of Birth for client.")
+  await fillClientDobInOpenForm($page, formatDateToMMDDYYYY(dobRaw)).catch(
+    (e) => console.warn("Client DOB fill failed:", e.message),
+  );
+
   await $page.waitForSelector("button.o-btn", {
     visible: true,
     timeout: 10000,
@@ -1222,10 +1434,14 @@ if (vehicleVin) {
       await selectFirstAvailableOption($page, "#vehicleTrim");
     }
   } else {
+    // No trim in the webhook — prefer a trim matching the body style
+    // (v1_body, e.g. "Sedan"), else the first one. Selecting a trim is what
+    // fills VIN pattern, body style, Price New/Value and symbols.
     console.warn(
-      "No trim value supplied by webhook (v1_trim / step_5_reg_type_1 missing) — selecting first available trim option.",
+      `No trim value supplied by webhook — picking a trim${vehicleBody ? ` matching "${vehicleBody}"` : ""}.`,
     );
-    await selectFirstAvailableOption($page, "#vehicleTrim");
+    const trimValue = await selectOptionPreferring($page, "#vehicleTrim", vehicleBody);
+    if (!trimValue) console.warn("Trim still empty after selection attempts");
   }
 }
 
@@ -1367,6 +1583,38 @@ const REVIEW_FIXERS = [
       return true;
     },
   },
+  {
+    key: "driverDob",
+    match: /required date of birth for driver/i,
+    fix: async (page) => {
+      const dob = formatDateToMMDDYYYY(dobRaw);
+      if (!dob) return false;
+      await goToTab(page, "drivers");
+      return setDateInput(page, "#driverDateOfBirth", dob);
+    },
+  },
+  {
+    key: "clientDob",
+    match: /required date of birth for client/i,
+    fix: async (page) => {
+      const dob = formatDateToMMDDYYYY(dobRaw);
+      if (!dob) return false;
+      await goToTab(page, "drivers");
+      return setClientDob(page, dob);
+    },
+  },
+  {
+    // All of these come from the vehicle having no trim selected (no VIN in
+    // the webhook) — re-pick the trim once for all of them.
+    key: "vehicleTrim",
+    match:
+      /invalid vin|body style not selected|price new \/ value|symbols are required/i,
+    fix: async (page) => {
+      if (vehicleVin) return false; // a real VIN was given — don't override
+      await goToTab(page, "vehicles");
+      return !!(await selectOptionPreferring(page, "#vehicleTrim", vehicleBody));
+    },
+  },
 ];
 
 // Rate All → open a plan summary: MAPFRE first, then MAIP (CAR), then any
@@ -1384,6 +1632,7 @@ let preferredResolveTried = false;
 // Run REVIEW_FIXERS over a list of warnings; returns the ones it couldn't fix.
 async function applyReviewFixers(page, warnings) {
   const unhandled = [];
+  const ranThisCall = new Map(); // fixer key → result (run shared fixers once)
   for (const w of warnings) {
     const fixer = REVIEW_FIXERS.find((f) => f.match.test(w));
     if (!fixer) {
@@ -1394,12 +1643,19 @@ async function applyReviewFixers(page, warnings) {
       unhandled.push(`${w} (still present after fixing)`);
       continue;
     }
-    const ok = await fixer.fix(page).catch((e) => {
-      console.warn(`Fixer failed for "${w}":`, e.message);
-      return false;
-    });
+    const key = fixer.key || fixer.match.source;
+    let ok;
+    if (ranThisCall.has(key)) {
+      ok = ranThisCall.get(key);
+    } else {
+      ok = await fixer.fix(page).catch((e) => {
+        console.warn(`Fixer failed for "${w}":`, e.message);
+        return false;
+      });
+      ranThisCall.set(key, ok);
+    }
     if (ok) fixedWarnings.add(w);
-    else unhandled.push(`${w} (no data to fix it)`);
+    else unhandled.push(`${w} (fix ran but field missing or value didn't stick)`);
   }
   return unhandled;
 }
@@ -1513,8 +1769,14 @@ for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
   const unhandled = await applyReviewFixers($page, warnings);
 
   if (unhandled.length) {
+    const diag = {
+      drivers: await describeTab($page, "drivers").catch((e) => e.message),
+      vehicles: await describeTab($page, "vehicles").catch((e) => e.message),
+    };
+    console.log("Page diagnostics:", JSON.stringify(diag, null, 2));
     throw new Error(
-      `Unhandled review warnings — add a fixer in REVIEW_FIXERS: ${JSON.stringify(unhandled)}`,
+      `Unhandled review warnings — add a fixer in REVIEW_FIXERS: ${JSON.stringify(unhandled)}\n` +
+        `DIAGNOSTICS: ${JSON.stringify(diag)}`,
     );
   }
 
