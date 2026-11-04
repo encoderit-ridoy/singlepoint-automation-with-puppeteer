@@ -1203,7 +1203,7 @@ const vehicleBody = String($json.body?.v1_body || "").trim(); // e.g. "Sedan"
 // Price New / Value: the webhook doesn't send one today, and the VIN lookup
 // doesn't always fill it (e.g. Tesla). Use a webhook value if one appears,
 // otherwise this default — CHANGE IT if you want a different assumption.
-const DEFAULT_PRICE_NEW = "35000";
+const DEFAULT_PRICE_NEW = "60000";
 const vehiclePriceNew = String(
   $json.body?.v1_price_new || $json.body?.v1_price || $json.body?.v1_value || "",
 ).replace(/[^\d]/g, "");
