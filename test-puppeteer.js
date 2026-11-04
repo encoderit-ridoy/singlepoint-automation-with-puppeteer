@@ -451,6 +451,49 @@ async function fillNumericAutocomplete(page, sel, value) {
   await sleep(150);
 }
 
+// Options tab → Policy History. Each of these is an autocomplete-style
+// input; plain typing shows the text but the app doesn't take it (that's
+// what caused "Required Policy History Years with Current Agency").
+const POLICY_HISTORY_FIELDS = [
+  { sel: "#yearsWithThisCarrier", value: "6" },
+  { sel: "#yearsWithCurrentAgency", value: "6" },
+  { sel: "#lapsedDaysLast12Months", value: "0" },
+  // typed as before (this one already worked) — no dropdown guessing
+  { sel: "#priorBodilyInjurylimits", value: "100/300", plain: true },
+];
+
+// Fill every Policy History field (Options tab must be open). With
+// onlyEmpty=true, fields that already have a value are left alone.
+// Returns true if every field ends up with a value.
+async function fillPolicyHistory(page, { onlyEmpty = false } = {}) {
+  let allOk = true;
+  for (const f of POLICY_HISTORY_FIELDS) {
+    try {
+      if (!(await page.$(f.sel))) {
+        console.warn(`Policy History field ${f.sel} not on page — skipped`);
+        continue;
+      }
+      if (onlyEmpty && (await hasValue(page, f.sel))) continue;
+      if (f.plain) {
+        await page.click(f.sel, { clickCount: 3 });
+        await page.keyboard.press("Backspace");
+        await page.keyboard.type(f.value, { delay: 100 });
+        await page.keyboard.press("Tab");
+        await sleep(300);
+      } else {
+        await fillNumericAutocomplete(page, f.sel, f.value);
+      }
+      const v = await page.$eval(f.sel, (el) => (el.value || "").trim()).catch(() => "");
+      console.log(`Policy History ${f.sel} = "${v}"`);
+      if (!v) allOk = false;
+    } catch (e) {
+      console.warn(`Policy History ${f.sel} failed: ${e.message}`);
+      allOk = false;
+    }
+  }
+  return allOk;
+}
+
 // Click a custom checkbox and ensure it ends up checked
 async function ensureChecked(page, baseId) {
   const SEL_ITEM = `#${baseId}`;
@@ -798,20 +841,91 @@ async function describeTab(page, name) {
 }
 
 // Clear + type into a datepicker input; returns true if a full date stuck
+// The date pickers are masked inputs: typing alone can show the date in the
+// box without the app's model taking it (so it's lost on save). Fire the
+// input/change/blur events the app listens for, close the calendar popup,
+// then re-read after a pause (the app may reformat or clear it) and retry.
 async function setDateInput(page, sel, mmddyyyy) {
+  if (!mmddyyyy) return false;
+  await page.waitForSelector(sel, { visible: true, timeout: 10000 });
+  const want = mmddyyyy.replace(/\D/g, "");
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
+    await page.click(sel, { clickCount: 3 }).catch(() => {});
+    for (let i = 0; i < 12; i++) await page.keyboard.press("Backspace");
+    await page.keyboard.type(mmddyyyy, { delay: 100 });
+    await page.evaluate((s) => {
+      const el = document.querySelector(s);
+      if (!el) return;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }, sel);
+    await page.keyboard.press("Escape").catch(() => {}); // close calendar
+    await page.keyboard.press("Tab").catch(() => {});
+    await page.evaluate((s) => {
+      document.querySelector(s)?.dispatchEvent(new Event("blur", { bubbles: true }));
+    }, sel);
+    await sleep(1200);
+    const got = await page
+      .$eval(sel, (el) => (el.value || "").replace(/\D/g, ""))
+      .catch(() => "");
+    if (got === want) return true;
+    console.warn(`setDateInput ${sel}: wanted ${mmddyyyy}, got "${got}" (attempt ${attempt})`);
+  }
+  return false;
+}
+
+// True if the field already has a value (at least `minDigits` digits when
+// given, e.g. 8 for a full date).
+async function hasValue(page, sel, minDigits = 0) {
+  const v = await page.$eval(sel, (el) => (el.value || "").trim()).catch(() => "");
+  return minDigits ? v.replace(/\D/g, "").length >= minDigits : !!v;
+}
+
+// SDIP: keep whatever is already there (e.g. "99" from RMV); type "00" only
+// when the field is empty.
+async function fillSdipIfEmpty(page) {
+  await page.waitForSelector("#driverSdip", { visible: true, timeout: 5000 });
+  if (await hasValue(page, "#driverSdip")) {
+    console.log("SDIP already filled — leaving it as is");
+    return;
+  }
+  await page.type("#driverSdip", "00", { delay: 100 });
+  await page.keyboard.press("Tab");
+  await sleep(500);
+}
+
+// Click "Save quote" on the Premiums tab so edits made after the first save
+// (e.g. by REVIEW_FIXERS) are persisted.
+async function saveQuote(page) {
+  const sel = "button.app-button.app-button--save-quote";
   await page.waitForSelector(sel, { visible: true, timeout: 10000 });
   await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
-  await page.click(sel, { clickCount: 3 }).catch(() => {});
-  for (let i = 0; i < 12; i++) await page.keyboard.press("Backspace");
-  await page.keyboard.type(mmddyyyy, { delay: 100 });
-  await page.keyboard.press("Tab");
-  await sleep(300);
-  return page
-    .$eval(sel, (el) => (el.value || "").replace(/\D/g, "").length >= 8)
-    .catch(() => false);
+  await page.click(sel, { delay: 50 });
+  await sleep(2000);
 }
 
 // Clear + type into a plain text input and fire input/change events
+// Fill Price New / Value on the (already open) Vehicles tab if it's empty.
+// Returns true if the field ends up with a value.
+async function ensureVehiclePrice(page) {
+  const sel = "#vehiclePriceValue";
+  const exists = await page.$(sel);
+  if (!exists) {
+    console.warn("Price New / Value field (#vehiclePriceValue) not found");
+    return false;
+  }
+  const current = await page.$eval(sel, (el) => (el.value || "").trim());
+  if (current) return true;
+  const price = vehiclePriceNew || DEFAULT_PRICE_NEW;
+  if (!vehiclePriceNew)
+    console.warn(`No price in webhook — using default Price New / Value ${price}`);
+  await setTextInput(page, sel, price);
+  const after = await page.$eval(sel, (el) => (el.value || "").trim());
+  console.log(`Price New / Value now "${after}"`);
+  return !!after;
+}
+
 async function setTextInput(page, sel, value) {
   await page.waitForSelector(sel, { visible: true, timeout: 10000 });
   await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
@@ -833,7 +947,44 @@ async function setTextInput(page, sel, value) {
   await sleep(300);
 }
 
+// Run `fn` up to `attempts` times inside the SAME browser session (so no new
+// quote is created). Between attempts runs `between` (e.g. re-open a tab).
+async function retry(label, fn, { attempts = 3, delay = 3000, between } = {}) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn(i);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`${label} failed (attempt ${i}/${attempts}): ${e.message}`);
+      if (i < attempts) {
+        await sleep(delay);
+        if (between) await between().catch(() => {});
+      }
+    }
+  }
+  throw lastErr;
+}
+
+const quoteUrl = () => {
+  try {
+    return $page.url();
+  } catch (_) {
+    return "unknown";
+  }
+};
+
+// Rate All Plans, retried: re-opens the Premiums tab between attempts.
 async function clickRateAllPlans(page) {
+  return retry("Rate All Plans", () => clickRateAllPlansOnce(page), {
+    between: async () => {
+      await goToTab(page, "premiums");
+      await page.waitForSelector("table.table tbody tr", { timeout: 15000 });
+    },
+  });
+}
+
+async function clickRateAllPlansOnce(page) {
   await page.waitForFunction(
     () =>
       Array.from(document.querySelectorAll("a.o-btn")).some(
@@ -1049,6 +1200,13 @@ const vehicleTrim = String(
   $json.body?.v1_trim || $json.body?.step_5_reg_type_1 || "",
 ).trim();
 const vehicleBody = String($json.body?.v1_body || "").trim(); // e.g. "Sedan"
+// Price New / Value: the webhook doesn't send one today, and the VIN lookup
+// doesn't always fill it (e.g. Tesla). Use a webhook value if one appears,
+// otherwise this default — CHANGE IT if you want a different assumption.
+const DEFAULT_PRICE_NEW = "35000";
+const vehiclePriceNew = String(
+  $json.body?.v1_price_new || $json.body?.v1_price || $json.body?.v1_value || "",
+).replace(/[^\d]/g, "");
 const vehicleZip = String($json.body?.v1_zip || "").trim();
 const address1 = String($json.body?.residential_address || "").trim();
 const city = String(
@@ -1266,7 +1424,8 @@ if (isRmvFlow) {
   await $page.keyboard.type("Insured", { delay: 100 });
   await $page.keyboard.press("Tab");
 
-  if (effectiveFirstLicenseDate) {
+  // RMV may already have filled First Licensed — only set it if empty
+  if (effectiveFirstLicenseDate && !(await hasValue($page, "#driverFirstLicensed", 8))) {
     await setDateInput(
       $page,
       "#driverFirstLicensed",
@@ -1274,10 +1433,24 @@ if (isRmvFlow) {
     );
   }
 
-  await $page.waitForSelector("#driverSdip", { visible: true, timeout: 5000 });
-  await $page.type("#driverSdip", "00", { delay: 100 });
-  await $page.keyboard.press("Tab");
-  await sleep(500);
+  await fillSdipIfEmpty($page);
+
+  // RMV data can finish loading after we typed and blank First Licensed —
+  // re-check and set it again if needed.
+  if (effectiveFirstLicenseDate) {
+    const fl = await $page
+      .$eval("#driverFirstLicensed", (el) => (el.value || "").trim())
+      .catch(() => "");
+    if (fl.replace(/\D/g, "").length < 8) {
+      console.warn(`First Licensed was cleared ("${fl}") — setting it again`);
+      const ok = await setDateInput(
+        $page,
+        "#driverFirstLicensed",
+        formatDateToMMDDYYYY(effectiveFirstLicenseDate),
+      );
+      if (!ok) console.warn("First Licensed still not set after retry");
+    }
+  }
 } else {
   // ── 4B. MANUAL ENTRY FLOW ────────────────────────────────
   await $page.waitForSelector(".sm-popup.is-active", { timeout: 30000 });
@@ -1326,10 +1499,7 @@ if (isRmvFlow) {
   await $page.keyboard.type(licenseState, { delay: 100 });
   await $page.keyboard.press("Tab");
 
-  await $page.waitForSelector("#driverSdip", { visible: true, timeout: 5000 });
-  await $page.type("#driverSdip", "00", { delay: 100 });
-  await $page.keyboard.press("Tab");
-  await sleep(500);
+  await fillSdipIfEmpty($page);
 
   // Update client address info
   await $page.waitForSelector(".aboutbox__title", { timeout: 10000 });
@@ -1474,6 +1644,11 @@ await $page.keyboard.press("Backspace");
 await $page.keyboard.type("10000", { delay: 100 });
 await $page.keyboard.press("Tab");
 await sleep(1000);
+
+// Price New / Value — not always filled by the VIN/trim lookup
+await ensureVehiclePrice($page).catch((e) =>
+  console.warn("Price New / Value fill failed:", e.message),
+);
 // ─────────────────────────────────────────────────────────────
 //  6.  OPTIONS TAB
 // ─────────────────────────────────────────────────────────────
@@ -1514,27 +1689,9 @@ if (expiryMMDDYYYY) {
   await $page.keyboard.press("Tab");
 }
 
-// 6-3. Years with this carrier (6)
-await fillNumericAutocomplete($page, "#yearsWithThisCarrier", "6");
-
-// 6-4. Years with current agency (6)
-await $page.waitForSelector("#yearsWithCurrentAgency", { timeout: 10000 });
-await $page.click("#yearsWithCurrentAgency", { clickCount: 3 });
-await $page.keyboard.press("Backspace");
-await $page.keyboard.type("6", { delay: 100 });
-await $page.keyboard.press("Tab");
-
-// 6-5. Lapsed days last 12 months (0)
-await $page.click("#lapsedDaysLast12Months", { clickCount: 3 });
-await $page.keyboard.press("Backspace");
-await $page.keyboard.type("0", { delay: 100 });
-await $page.keyboard.press("Tab");
-
-// 6-6. Prior bodily injury limits
-await $page.click("#priorBodilyInjurylimits", { clickCount: 3 });
-await $page.keyboard.press("Backspace");
-await $page.keyboard.type("100/300", { delay: 100 });
-await $page.keyboard.press("Tab");
+// 6-3 … 6-6. Policy History fields (years w/ carrier, years w/ agency,
+// lapsed days, prior BI limits) — filled + verified, see fillPolicyHistory
+await fillPolicyHistory($page);
 await sleep(1000);
 
 // ── 6A. Required (red) option items ──────────────────────
@@ -1549,15 +1706,7 @@ await $page.click('.tabs__list .tabs__item a[href*="premiums"]');
 await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
 
 // Save quote
-await $page.waitForSelector("button.app-button.app-button--save-quote", {
-  visible: true,
-  timeout: 10000,
-});
-await $page.$eval("button.app-button.app-button--save-quote", (el) =>
-  el.scrollIntoView({ block: "center" }),
-);
-await $page.click("button.app-button.app-button--save-quote", { delay: 50 });
-await sleep(2000);
+await saveQuote($page);
 
 // Each known Review warning maps to a fix on the right tab. Add a new entry
 // here whenever a run fails with an "Unhandled review warnings" error.
@@ -1604,11 +1753,40 @@ const REVIEW_FIXERS = [
     },
   },
   {
-    // All of these come from the vehicle having no trim selected (no VIN in
-    // the webhook) — re-pick the trim once for all of them.
+    // Price New / Value (and "Price ... Or Symbols") missing. With no VIN,
+    // first make sure a trim is picked (that can fill price/symbols), then
+    // fill the price field directly if it's still empty.
+    key: "vehiclePrice",
+    match: /price new \/ value/i,
+    fix: async (page) => {
+      await goToTab(page, "vehicles");
+      if (!vehicleVin) {
+        const trim = await page
+          .$eval("#vehicleTrim", (el) => (el.value || "").trim())
+          .catch(() => "");
+        if (!trim) await selectOptionPreferring(page, "#vehicleTrim", vehicleBody);
+      }
+      return ensureVehiclePrice(page);
+    },
+  },
+  {
+    // "Required Policy History Years with Current Agency" (and any other
+    // Policy History field) → re-fill all Policy History fields on Options.
+    key: "policyHistory",
+    match: /policy history|years with current agency|years with (this|prior) carrier|lapsed days|prior bodily injury/i,
+    fix: async (page) => {
+      await goToTab(page, "options");
+      await page
+        .waitForSelector("#yearsWithCurrentAgency", { timeout: 15000 })
+        .catch(() => {});
+      return fillPolicyHistory(page);
+    },
+  },
+  {
+    // These come from the vehicle having no trim selected (no VIN in the
+    // webhook) — re-pick the trim once for all of them.
     key: "vehicleTrim",
-    match:
-      /invalid vin|body style not selected|price new \/ value|symbols are required/i,
+    match: /invalid vin|body style not selected|symbols are required/i,
     fix: async (page) => {
       if (vehicleVin) return false; // a real VIN was given — don't override
       await goToTab(page, "vehicles");
@@ -1628,6 +1806,7 @@ const fixedWarnings = new Set();
 let summaryOpened = false;
 let summaryCarrier = null;
 let preferredResolveTried = false;
+let emptyReviewRounds = 0;
 
 // Run REVIEW_FIXERS over a list of warnings; returns the ones it couldn't fix.
 async function applyReviewFixers(page, warnings) {
@@ -1707,6 +1886,7 @@ if (IS_JRN) {
 
     await goToTab($page, "premiums");
     await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
+    await saveQuote($page); // persist what the fixers changed
     await sleep(2000);
   }
 }
@@ -1760,9 +1940,26 @@ for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
   );
 
   if (!warnings.length) {
+    // Rating may still be running or the table may not have refreshed yet —
+    // wait, re-rate anything ratable and try again before giving up.
+    emptyReviewRounds++;
+    if (emptyReviewRounds <= 2) {
+      console.warn(
+        `No summary and no Review warnings (round ${round}) — waiting and re-rating`,
+      );
+      await goToTab($page, "premiums");
+      await $page
+        .waitForSelector("table.table tbody tr", { timeout: 15000 })
+        .catch(() => {});
+      await clickRateAllPlans($page).catch((e) =>
+        console.warn("Re-rate failed:", e.message),
+      );
+      await waitForRatingSettled($page);
+      continue;
+    }
     const states = await getPremiumRowStates($page).catch(() => []);
     throw new Error(
-      `No 'View Plan Summary' and no Review warnings found. Row states: ${JSON.stringify(states)}`,
+      `No 'View Plan Summary' and no Review warnings found. Quote: ${quoteUrl()} Row states: ${JSON.stringify(states)}`,
     );
   }
 
@@ -1772,10 +1969,12 @@ for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
     const diag = {
       drivers: await describeTab($page, "drivers").catch((e) => e.message),
       vehicles: await describeTab($page, "vehicles").catch((e) => e.message),
+      options: await describeTab($page, "options").catch((e) => e.message),
     };
     console.log("Page diagnostics:", JSON.stringify(diag, null, 2));
     throw new Error(
       `Unhandled review warnings — add a fixer in REVIEW_FIXERS: ${JSON.stringify(unhandled)}\n` +
+        `Quote: ${quoteUrl()}\n` +
         `DIAGNOSTICS: ${JSON.stringify(diag)}`,
     );
   }
@@ -1783,13 +1982,14 @@ for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
   // back to Premiums; the next round rates whatever is now ratable
   await goToTab($page, "premiums");
   await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
+  await saveQuote($page); // persist what the fixers changed
   await sleep(2000);
 }
 
 if (!summaryOpened) {
   const states = await getPremiumRowStates($page).catch(() => []);
   throw new Error(
-    `No 'View Plan Summary' after ${MAX_RATE_ROUNDS} rate rounds. Row states: ${JSON.stringify(states)}`,
+    `No 'View Plan Summary' after ${MAX_RATE_ROUNDS} rate rounds. Quote: ${quoteUrl()} Row states: ${JSON.stringify(states)}`,
   );
 }
 await sleep(3000);
@@ -1798,8 +1998,11 @@ await sleep(3000);
 //  8.  CAPTURE PDF — intercept Blob created by "Print Long Proposal"
 // ─────────────────────────────────────────────────────────────
 
+// Capture PDF blobs created via URL.createObjectURL. Idempotent: safe to
+// inject more than once into the same page.
 const BLOB_HOOK = () => {
   (function () {
+    if (window.__pdfQueues__) return;
     const origCreate = URL.createObjectURL.bind(URL);
     Object.defineProperty(window, "__pdfQueues__", {
       value: [],
@@ -1824,94 +2027,14 @@ const BLOB_HOOK = () => {
   })();
 };
 
+// Install for future navigations AND in the page that's already open (the
+// app is a single-page app, so evaluateOnNewDocument alone never runs).
 if ($page.evaluateOnNewDocument) {
-  await $page.evaluateOnNewDocument(BLOB_HOOK);
-} else {
-  await $page.evaluate(BLOB_HOOK).catch(() => {});
+  await $page.evaluateOnNewDocument(BLOB_HOOK).catch(() => {});
 }
+await $page.evaluate(BLOB_HOOK).catch(() => {});
 
-const popupPromise = new Promise((resolve) => {
-  $page.once("popup", async (p) => {
-    try {
-      if (p.evaluateOnNewDocument) await p.evaluateOnNewDocument(BLOB_HOOK);
-      else await p.evaluate(BLOB_HOOK).catch(() => {});
-    } catch (_) {}
-    resolve(p);
-  });
-});
-
-// The print launcher only exists once the plan summary/proposal panel has
-// actually rendered. Instead of a single wait that either finds it or
-// throws a bare timeout, retry re-opening the summary a couple of times
-// before giving up with a clear message.
-let printLauncherFound = false;
-for (let attempt = 0; attempt < 3 && !printLauncherFound; attempt++) {
-  printLauncherFound = await $page
-    .waitForSelector("#tooltipLauncherPrint", { timeout: 15000 })
-    .then(() => true)
-    .catch(() => false);
-  if (!printLauncherFound) {
-    console.warn(
-      `#tooltipLauncherPrint not found (attempt ${attempt + 1}/3), retrying plan summary...`,
-    );
-    await findAndOpenPlanSummary($page, summaryCarrier).catch(() => {});
-    await sleep(3000);
-  }
-}
-
-if (!printLauncherFound) {
-  throw new Error(
-    "Plan summary/proposal page never rendered the print launcher after 3 attempts — most likely no rated plan was actually available to view. Check the Premiums tab to see what rating actually returned.",
-  );
-}
-
-await $page.$eval("#tooltipLauncherPrint", (el) => {
-  el.scrollIntoView({ block: "center" });
-  el.click();
-});
-await $page.waitForSelector(".tooltip__menu", { timeout: 10000 });
-
-const clickedProposal = await $page.evaluate(() => {
-  const target = Array.from(
-    document.querySelectorAll(".tooltip__menu a.tooltip__menu-link"),
-  ).find((a) =>
-    /Print\s*Long\s*Proposal/i.test(
-      (a.innerText || a.textContent || "").trim(),
-    ),
-  );
-  if (!target) return false;
-  target.scrollIntoView({ block: "center" });
-  target.click();
-  return true;
-});
-if (!clickedProposal) throw new Error('Could not find "Print Long Proposal"');
-
-// Detect new popup tab
-let newTab = null;
-try {
-  newTab = await Promise.race([popupPromise, sleep(1500).then(() => null)]);
-} catch (_) {}
-
-// Allow blob creation to complete
-if (newTab) {
-  await newTab.bringToFront().catch(() => {});
-  await Promise.race([
-    newTab
-      .waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 })
-      .catch(() => {}),
-    newTab.waitForSelector("body", { timeout: 15000 }).catch(() => {}),
-    sleep(2000),
-  ]);
-} else {
-  await Promise.race([
-    $page
-      .waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 })
-      .catch(() => {}),
-    sleep(2000),
-  ]);
-}
-
-// Pull captured PDF bytes from main tab and popup
+// Pull captured PDF bytes from a page
 async function pullFrom(pg) {
   try {
     const arrays = await pg.evaluate(() =>
@@ -1924,46 +2047,162 @@ async function pullFrom(pg) {
   }
 }
 
-const mainBufs = await pullFrom($page);
-const popupBufs = newTab ? await pullFrom(newTab) : [];
-let allBufs = mainBufs.concat(popupBufs).filter((b) => b && b.length);
+// Make sure the plan summary is open with its print launcher visible.
+async function ensurePrintLauncher() {
+  const visible = () =>
+    $page
+      .waitForSelector("#tooltipLauncherPrint", { timeout: 15000 })
+      .then(() => true)
+      .catch(() => false);
+  if (await visible()) return;
+  console.warn("#tooltipLauncherPrint not visible — re-opening plan summary");
+  await $page.keyboard.press("Escape").catch(() => {});
+  await goToTab($page, "premiums").catch(() => {});
+  await $page
+    .waitForSelector("table.table tbody tr", { timeout: 15000 })
+    .catch(() => {});
+  const reopened =
+    (await findAndOpenPlanSummary($page, summaryCarrier).catch(() => false)) ||
+    (await findAndOpenPlanSummary($page).catch(() => false));
+  if (!reopened) throw new Error("No 'View plan summary' button to re-open");
+  await sleep(3000);
+  if (!(await visible()))
+    throw new Error("Plan summary opened but print launcher never appeared");
+}
 
-// Fallback: network-level sniff for PDF responses
-if (!allBufs.length) {
-  const pdfs = [];
+// Open the print tooltip menu. The launcher TOGGLES the menu, so only click
+// it when the "Print Long Proposal" link isn't already in the DOM (a blind
+// re-click would close a menu that's already open). Checks for existence,
+// not visibility — the menu animates in and can read as "not visible".
+async function openPrintMenu() {
+  const hasProposalLink = () =>
+    $page
+      .evaluate(() =>
+        Array.from(document.querySelectorAll(".tooltip__menu a, .tooltip__menu-link")).some(
+          (a) => /Print\s*Long\s*Proposal/i.test(a.textContent || ""),
+        ),
+      )
+      .catch(() => false);
+
+  for (let i = 1; i <= 3; i++) {
+    if (await hasProposalLink()) return;
+    if (i === 1) {
+      await $page.$eval("#tooltipLauncherPrint", (el) => {
+        el.scrollIntoView({ block: "center" });
+        el.click();
+      });
+    } else {
+      // real mouse click as a fallback (some tooltips ignore el.click())
+      const h = await $page.$("#tooltipLauncherPrint");
+      const box = h && (await h.boundingBox());
+      if (box) await $page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    }
+    const appeared = await $page
+      .waitForFunction(
+        () =>
+          Array.from(document.querySelectorAll(".tooltip__menu a, .tooltip__menu-link")).some(
+            (a) => /Print\s*Long\s*Proposal/i.test(a.textContent || ""),
+          ),
+        { timeout: 6000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (appeared) return;
+    console.warn(`Print menu didn't open (click ${i}/3)`);
+  }
+  throw new Error("Print menu (Print Long Proposal) never opened");
+}
+
+// One full attempt: open print menu → Print Long Proposal → collect the PDF
+// from blob hooks (main tab + popup) or from network responses.
+async function capturePdfOnce() {
+  await ensurePrintLauncher();
+  await $page.evaluate(BLOB_HOOK).catch(() => {});
+  await $page
+    .evaluate(() => {
+      if (Array.isArray(window.__pdfQueues__)) window.__pdfQueues__.length = 0;
+    })
+    .catch(() => {});
+
+  // Network sniffer must be listening BEFORE the click
+  const sniffed = [];
   const sniff = async (resp) => {
     try {
       const headers = resp.headers() || {};
       const ct = (headers["content-type"] || "").toLowerCase();
       const cd = (headers["content-disposition"] || "").toLowerCase();
+      if (!ct.includes("pdf") && !cd.includes(".pdf") && !ct.includes("octet-stream"))
+        return;
       const buf = await (resp.buffer
         ? resp.buffer()
         : Buffer.from(await resp.arrayBuffer()));
-      if (!buf || !buf.length) return;
-      const isPdf =
-        ct.includes("application/pdf") ||
-        cd.includes(".pdf") ||
-        buf.slice(0, 5).toString("ascii") === "%PDF-";
-      if (isPdf) pdfs.push(buf);
+      if (buf && buf.length && buf.slice(0, 5).toString("ascii") === "%PDF-")
+        sniffed.push(buf);
     } catch (_) {}
   };
   $page.on("response", sniff);
-  if (newTab) newTab.on("response", sniff);
-  await sleep(3000);
-  $page.off("response", sniff);
-  if (newTab) newTab.off("response", sniff);
-  allBufs = pdfs;
+
+  let newTab = null;
+  const onPopup = async (p) => {
+    newTab = p;
+    try {
+      p.on("response", sniff);
+      if (p.evaluateOnNewDocument) await p.evaluateOnNewDocument(BLOB_HOOK);
+      await p.evaluate(BLOB_HOOK).catch(() => {});
+    } catch (_) {}
+  };
+  $page.on("popup", onPopup);
+
+  try {
+    await openPrintMenu();
+
+    const clickedProposal = await $page.evaluate(() => {
+      const target = Array.from(
+        document.querySelectorAll(".tooltip__menu a, .tooltip__menu-link"),
+      ).find((a) =>
+        /Print\s*Long\s*Proposal/i.test((a.innerText || a.textContent || "").trim()),
+      );
+      if (!target) return false;
+      target.scrollIntoView({ block: "center" });
+      target.click();
+      return true;
+    });
+    if (!clickedProposal) throw new Error('Could not find "Print Long Proposal"');
+
+    // Poll up to ~30s for the PDF to show up anywhere
+    let bufs = [];
+    for (let waited = 0; waited < 30000 && !bufs.length; waited += 1000) {
+      await sleep(1000);
+      bufs = [
+        ...(await pullFrom($page)),
+        ...(newTab ? await pullFrom(newTab) : []),
+        ...sniffed,
+      ].filter((b) => b && b.length);
+    }
+    if (!bufs.length)
+      throw new Error(
+        "No PDF captured. The app may be rendering print-HTML instead of a PDF blob.",
+      );
+    bufs.sort((a, b) => b.length - a.length);
+    return bufs[0];
+  } finally {
+    $page.off("response", sniff);
+    $page.off("popup", onPopup);
+    if (newTab) await newTab.close().catch(() => {});
+    await $page.bringToFront().catch(() => {});
+  }
 }
 
-if (!allBufs.length) {
-  throw new Error(
-    "No PDF captured. The app may be rendering print-HTML instead of a PDF blob.",
-  );
+let pdfBuffer;
+try {
+  pdfBuffer = await retry("Capture PDF", capturePdfOnce, {
+    attempts: 3,
+    delay: 3000,
+    between: () => $page.keyboard.press("Escape"),
+  });
+} catch (e) {
+  throw new Error(`${e.message} Quote: ${quoteUrl()}`);
 }
-
-// Pick the largest buffer
-allBufs.sort((a, b) => b.length - a.length);
-const pdfBuffer = allBufs[0];
 
 const now = new Date();
 const fileDate = [
