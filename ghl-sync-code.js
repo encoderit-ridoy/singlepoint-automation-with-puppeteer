@@ -401,7 +401,14 @@ policies.forEach((policy, policyIndex) => {
     const isExpired = s === "expired";
 
     if (isActive) {
-      activePolicies.push({ type: policyTitle, premium, expirationDate });
+      activePolicies.push({
+        type: policyTitle,
+        premium,
+        expirationDate,
+        effectiveDate,
+        policyNumber,
+        status: s,
+      });
     }
     if (isProspect) prospectPolicies.push({ type: policyTitle });
     if (isCancelled) cancelledPolicies.push({ type: policyTitle, applicationType });
@@ -550,6 +557,23 @@ ghlContact.customFields.total_quoted_premium =
 ghlContact.customFields.active_policies_count = activePolicies.length;
 ghlContact.customFields.prospect_policies_count = prospectPolicies.length;
 ghlContact.customFields.cancelled_policies_count = cancelledPolicies.length;
+
+// ---- Active policy number for email subjects ----
+// Use {{contact.active_policy_number}} in templates instead of policyN_number,
+// so a cancelled policy in slot 1 never shows up in the subject.
+// Only Active / New / Renewal policies qualify. If several, the most recent
+// one (latest effective date) wins. Empty when the client has none.
+const SUBJECT_POLICY_STATUSES = new Set(["active", "new", "renewal"]);
+const effTime = (p) => {
+  const t = new Date(p.effectiveDate).getTime();
+  return isNaN(t) ? 0 : t;
+};
+const subjectPolicy = activePolicies
+  .filter((p) => p.policyNumber && SUBJECT_POLICY_STATUSES.has(p.status))
+  .sort((a, b) => effTime(b) - effTime(a))[0];
+ghlContact.customFields.active_policy_number = subjectPolicy
+  ? subjectPolicy.policyNumber
+  : "";
 
 if (upcomingRenewals.length > 0) {
   upcomingRenewals.sort((a, b) => a.daysUntil - b.daysUntil);
@@ -961,10 +985,16 @@ if (ccNpsMatch) ghlContact.tags.push(NPS_SENT_TAG);
 // CONVERT CUSTOM FIELDS TO GHL ARRAY FORMAT
 // ============================================================
 
+// Sent even when empty, so GHL clears the old value
+// when a client's last active policy is cancelled.
+const ALWAYS_SEND_FIELDS = new Set(["active_policy_number"]);
+
 const customFieldsArray = [];
 Object.keys(ghlContact.customFields).forEach((key) => {
   const value = ghlContact.customFields[key];
-  if (value !== "" && value !== null && value !== undefined) {
+  if (ALWAYS_SEND_FIELDS.has(key)) {
+    customFieldsArray.push({ key: key, field_value: String(value ?? "") });
+  } else if (value !== "" && value !== null && value !== undefined) {
     customFieldsArray.push({ key: key, field_value: String(value) });
   }
 });
