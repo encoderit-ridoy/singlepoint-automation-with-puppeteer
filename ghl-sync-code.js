@@ -353,11 +353,12 @@ let totalQuotedPremium = 0;
 
 // "New" policies count as active (same as Active / Renewal / Inforce)
 const ACTIVE_STATUSES = new Set(["active", "new", "renewal", "inforce"]);
+// "Lead" from HawkSoft is treated as Prospect
+const PROSPECT_STATUSES = new Set(["prospect", "lead"]);
 
 const activePolicies = [];
 const prospectPolicies = [];
 const cancelledPolicies = [];
-const expiredPolicies = [];
 const upcomingRenewals = [];
 
 policies.forEach((policy, policyIndex) => {
@@ -366,7 +367,7 @@ policies.forEach((policy, policyIndex) => {
 
     const policyType = cleanString(safeGet(policy, "type", ""));
     const policyTitle = cleanString(safeGet(policy, "title", "")).toUpperCase();
-    const policyStatus = cleanString(safeGet(policy, "status", ""));
+    let policyStatus = cleanString(safeGet(policy, "status", ""));
     const policySubStatus = cleanString(safeGet(policy, "subStatus", ""));
     const policyNumber = cleanString(safeGet(policy, "policyNumber", ""));
     const accountNumber = cleanString(safeGet(policy, "accountNumber", ""));
@@ -394,11 +395,21 @@ policies.forEach((policy, policyIndex) => {
 
     // ---- Status classification ----
     // Normalized: lowercase, spaces/hyphens/underscores removed ("In Force" == "inforce")
-    const s = policyStatus.toLowerCase().replace(/[\s_-]+/g, "");
+    let s = policyStatus.toLowerCase().replace(/[\s_-]+/g, "");
+
+    // "Cancelled (Pending)" is still in force until the cancel date -> Active
+    if (s === "cancelled(pending)" || s === "canceled(pending)") {
+      s = "active";
+      policyStatus = "Active";
+    }
+
     const isActive = ACTIVE_STATUSES.has(s);
-    const isProspect = s === "prospect";
-    const isCancelled = s === "cancelled" || s === "canceled" || s === "nonrenew";
-    const isExpired = s === "expired";
+    // Prospect / Lead -> Prospect. Anything else that isn't active
+    // (Cancelled, Nonrenew, Expired, or any unknown status) -> Cancelled.
+    const isProspect = PROSPECT_STATUSES.has(s);
+    const isCancelled = s !== "" && !isActive && !isProspect;
+    if (isProspect) policyStatus = "Prospect";
+    if (isCancelled) policyStatus = "Cancelled";
 
     if (isActive) {
       activePolicies.push({
@@ -412,7 +423,6 @@ policies.forEach((policy, policyIndex) => {
     }
     if (isProspect) prospectPolicies.push({ type: policyTitle });
     if (isCancelled) cancelledPolicies.push({ type: policyTitle, applicationType });
-    if (isExpired) expiredPolicies.push({ type: policyTitle });
 
     totalPremium += premium;
     totalQuotedPremium += quotedPremium;
@@ -589,7 +599,7 @@ if (upcomingRenewals.length > 0) {
 
 const hasActive = activePolicies.length > 0;
 const hasProspect = prospectPolicies.length > 0;
-const hasLapsed = cancelledPolicies.length > 0 || expiredPolicies.length > 0;
+const hasLapsed = cancelledPolicies.length > 0;
 
 let lifecycleTag;
 if (hasActive) lifecycleTag = "Active-Client";
