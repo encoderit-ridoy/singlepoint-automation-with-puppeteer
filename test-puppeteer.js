@@ -1,32 +1,34 @@
 // ============================================================
 //  SinglePoint Auto-Insurance Quote — n8n Puppeteer Node
-//  Full script: login → driver → vehicles → options → premiums → PDF
-//  Compatible with n8n "Execute Browser" / Puppeteer node.
-//  No external packages required.
+//  login → driver → vehicles → options → premiums → PDF
 //
-//  CHANGE LOG (this revision):
-//   - vehicleTrim now falls back to "first available option" instead of
-//     typing an empty string when step_5_reg_type_1 / v1_trim is missing.
-//   - Premiums flow rewritten to match the real DOM: after "Rate All
-//     Plans", wait ~30s, then scan the table for the first ENABLED
-//     "View plan summary" button and click it. MAIP (CAR) / MAPFRE never
-//     expose that button (they use a "Review" flow instead), which is why
-//     the old MAIP-specific logic dead-ended and caused the
-//     #tooltipLauncherPrint timeout.
-//   - #tooltipLauncherPrint wait now retries opening the plan summary up
-//     to 3x with a clear error on final failure.
+//  CHANGE LOG (v3 — 2026-11-12):
+//   - ROOT-CAUSE FIX: date fields (DOB / First Licensed / prior exp) are
+//     masked inputs. Typing digits key-by-key raced the mask and dropped
+//     characters ("09181999" → "09/81/9"). setDateInput now sets the
+//     formatted value in one shot via the native value setter + input/
+//     change/blur events, then falls back to slow typing, and verifies.
+//   - setDateInput no longer presses Escape — Escape closed the Client
+//     info modal before "Update info" was clicked, which is why client
+//     DOB never stuck ("Required Date of Birth for client").
+//   - Manual (non-MA licence) flow: driver tab is verified and re-filled
+//     before leaving it; gender + marital status are now filled.
+//   - Vehicle garaging zip is verified (it was ending up blank).
+//   - Options: prior carrier + prior expiration come from the webhook
+//     when present (fallback: "Other" / today + 1 yr).
+//   - New REVIEW_FIXERS: gender, marital status.
+//   - SPR login read from n8n env vars when available.
 // ============================================================
 
 // ─────────────────────────────────────────────────────────────
-//  0.  TOP-LEVEL HELPERS  (available everywhere in this script)
+//  0.  HELPERS
 // ─────────────────────────────────────────────────────────────
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// "YYYY-MM-DD" (or anything Date can parse) → "MMDDYYYY"
 function formatDateToMMDDYYYY(dateStr) {
   if (!dateStr) return "";
-  // "YYYY-MM-DD" is parsed by Date as UTC midnight, which shifts to the
-  // previous day on servers west of UTC — read the parts directly instead.
   const iso = String(dateStr).match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
   if (iso) {
     return `${iso[2].padStart(2, "0")}${iso[3].padStart(2, "0")}${iso[1]}`;
@@ -35,8 +37,7 @@ function formatDateToMMDDYYYY(dateStr) {
   if (isNaN(date.getTime())) return "";
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
-  const year = date.getFullYear();
-  return `${month}${day}${year}`;
+  return `${month}${day}${date.getFullYear()}`;
 }
 
 // Open a custom autocomplete / select-like input so options appear
@@ -48,14 +49,12 @@ async function openSelectLike(page, inputSel) {
   );
   await page.click(inputSel).catch(() => {});
   await page.focus(inputSel).catch(() => {});
-  // remove readonly if any
   await page.evaluate((s) => {
     const el = document.querySelector(s);
     if (el) el.removeAttribute("readonly");
   }, inputSel);
   await page.keyboard.press("ArrowDown").catch(() => {});
   await page.keyboard.press("Space").catch(() => {});
-  // click any toggle/caret button inside the same wrapper
   await page.evaluate((s) => {
     const el = document.querySelector(s);
     if (!el) return;
@@ -72,8 +71,10 @@ async function openSelectLike(page, inputSel) {
   }, inputSel);
 }
 
-// Try to click an option by text — first relative to the input, then globally
-async function pickByTextRobust(page, inputSel, text) {
+// Click an option by text — near the input, then globally. With
+// allowBlindPick=false the "ArrowDown+Enter" fallback is skipped so a
+// wrong option is never chosen silently.
+async function pickByTextRobust(page, inputSel, text, allowBlindPick = true) {
   const nearSels = [
     ".sm-input-select__menu .sm-input-select__option",
     ".autocomplete__menu .autocomplete__item",
@@ -97,7 +98,6 @@ async function pickByTextRobust(page, inputSel, text) {
     '[role="option"]',
   ];
 
-  // 1) near the input
   const near = await page.evaluate(
     (s, target, sels) => {
       const norm = (x) => (x || "").trim().toLowerCase();
@@ -115,6 +115,7 @@ async function pickByTextRobust(page, inputSel, text) {
         );
         const hit =
           vis.find((n) => norm(n.textContent) === norm(target)) ||
+          vis.find((n) => norm(n.textContent).startsWith(norm(target))) ||
           vis.find((n) => norm(n.textContent).includes(norm(target)));
         if (hit) {
           hit.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
@@ -130,7 +131,6 @@ async function pickByTextRobust(page, inputSel, text) {
   );
   if (near) return true;
 
-  // 2) global (overlays / portals)
   const global_ = await page.evaluate(
     (target, sels) => {
       const norm = (x) => (x || "").trim().toLowerCase();
@@ -140,6 +140,7 @@ async function pickByTextRobust(page, inputSel, text) {
         );
         const hit =
           vis.find((n) => norm(n.textContent) === norm(target)) ||
+          vis.find((n) => norm(n.textContent).startsWith(norm(target))) ||
           vis.find((n) => norm(n.textContent).includes(norm(target)));
         if (hit) {
           hit.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
@@ -154,18 +155,17 @@ async function pickByTextRobust(page, inputSel, text) {
   );
   if (global_) return true;
 
-  // 3) keyboard fallback
+  if (!allowBlindPick) return false;
   try {
     await page.keyboard.press("ArrowDown");
     await page.keyboard.press("Enter");
     return true;
   } catch (_) {}
-
   return false;
 }
 
-// Full select-like fill: open → clear → type → pick → tab
-async function fillSelectLike(page, inputSel, value) {
+// open → clear → type → pick → tab
+async function fillSelectLike(page, inputSel, value, allowBlindPick = true) {
   await openSelectLike(page, inputSel);
   await page.click(inputSel, { clickCount: 3 }).catch(() => {});
   for (let i = 0; i < 8; i++) {
@@ -174,15 +174,30 @@ async function fillSelectLike(page, inputSel, value) {
     } catch (_) {}
   }
   await page.type(inputSel, value, { delay: 70 });
-  await sleep(400);
-  const ok = await pickByTextRobust(page, inputSel, value);
+  await sleep(500);
+  const ok = await pickByTextRobust(page, inputSel, value, allowBlindPick);
   await page.keyboard.press("Tab").catch(() => {});
+  await sleep(300);
   return ok;
 }
 
-// NEW: when we don't have a specific value to type (e.g. trim missing from
-// the webhook payload), open the dropdown and just take whatever the first
-// visible option is, instead of typing an empty string and matching garbage.
+// Fill a select-like field and confirm the input now contains the wanted
+// text. Returns the final value ("" = failed).
+async function fillSelectVerified(page, sel, value, { attempts = 2 } = {}) {
+  if (!value || !(await page.$(sel))) return "";
+  for (let i = 1; i <= attempts; i++) {
+    await fillSelectLike(page, sel, value, false).catch(() => {});
+    const got = await page
+      .$eval(sel, (el) => (el.value || "").trim())
+      .catch(() => "");
+    if (got && got.toLowerCase().includes(value.toLowerCase())) return got;
+    console.warn(
+      `fillSelectVerified ${sel}: wanted "${value}", got "${got}" (attempt ${i})`,
+    );
+  }
+  return "";
+}
+
 async function selectFirstAvailableOption(page, inputSel) {
   await openSelectLike(page, inputSel);
   await sleep(400);
@@ -215,10 +230,7 @@ async function selectFirstAvailableOption(page, inputSel) {
   return picked;
 }
 
-// Pick an option from a select-like dropdown: the first option whose text
-// contains `prefer` (e.g. "sedan"), else the first option. Waits for the
-// options to load (trims load async after model) and verifies the input
-// ended up with a value. Returns the input's final value ("" = failed).
+// First option containing `prefer`, else the first option. Verifies.
 async function selectOptionPreferring(page, inputSel, prefer = "") {
   for (let attempt = 0; attempt < 3; attempt++) {
     await openSelectLike(page, inputSel);
@@ -238,10 +250,10 @@ async function selectOptionPreferring(page, inputSel, prefer = "") {
           ".dropdown-menu .dropdown-item",
         ];
         const visible = (n) => !!(n.offsetParent || n.getClientRects().length);
-        // options inside the input's own wrapper first, then global overlays
         const root =
-          host?.closest(".sm-input-select,.autocomplete,.ng-select,.mat-select,.dropdown") ||
-          null;
+          host?.closest(
+            ".sm-input-select,.autocomplete,.ng-select,.mat-select,.dropdown",
+          ) || null;
         for (const scope of [root, document].filter(Boolean)) {
           for (const sel of sels) {
             const opts = Array.from(scope.querySelectorAll(sel)).filter(
@@ -250,7 +262,8 @@ async function selectOptionPreferring(page, inputSel, prefer = "") {
             if (!opts.length) continue;
             const p = (prefer || "").toLowerCase();
             const hit =
-              (p && opts.find((n) => n.textContent.toLowerCase().includes(p))) ||
+              (p &&
+                opts.find((n) => n.textContent.toLowerCase().includes(p))) ||
               opts[0];
             hit.scrollIntoView({ block: "center" });
             hit.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
@@ -276,22 +289,23 @@ async function selectOptionPreferring(page, inputSel, prefer = "") {
   return "";
 }
 
-// Find a visible date-of-birth input inside the element matching rootSel
-// (by id/name/placeholder or by its label text). Tags it with
-// data-dob-target and returns a selector for it, or null.
+// Visible DOB input inside rootSel (by id/name/placeholder or label text)
 async function findDobInput(page, rootSel = "body") {
   return page.evaluate((rootSel) => {
-    // never fall back to the whole page — it would grab the driver DOB field
     const root = document.querySelector(rootSel);
     if (!root) return null;
     const visible = (n) => !!(n.offsetParent || n.getClientRects().length);
     const re = /birth|\bdob\b/i;
     const inputs = Array.from(root.querySelectorAll("input")).filter(visible);
     let target = inputs.find((i) =>
-      re.test(`${i.id} ${i.name} ${i.placeholder} ${i.getAttribute("aria-label") || ""}`),
+      re.test(
+        `${i.id} ${i.name} ${i.placeholder} ${i.getAttribute("aria-label") || ""}`,
+      ),
     );
     if (!target) {
-      for (const lbl of root.querySelectorAll("label, .o-label, th, td, span, div")) {
+      for (const lbl of root.querySelectorAll(
+        "label, .o-label, th, td, span, div",
+      )) {
         if (lbl.children.length > 3) continue;
         if (!re.test(lbl.textContent || "")) continue;
         const forId = lbl.getAttribute && lbl.getAttribute("for");
@@ -315,44 +329,64 @@ async function findDobInput(page, rootSel = "body") {
   }, rootSel);
 }
 
+// Is the Client info edit form currently open?
+async function clientFormOpen(page) {
+  return page
+    .$eval(
+      "#clientInfoAddrZip_StreetAddress",
+      (el) => !!(el.offsetParent || el.getClientRects().length),
+    )
+    .catch(() => false);
+}
+
 // Open the "Client:" box edit form, set client DOB, click "Update info".
 async function setClientDob(page, mmddyyyy) {
-  const opened = await page.evaluate(() => {
-    const box = Array.from(document.querySelectorAll(".aboutbox")).find(
-      (b) => b.querySelector(".aboutbox__title")?.textContent.trim() === "Client:",
-    );
-    const link = box?.querySelector("a.aboutbox__link");
-    if (!link) return false;
-    link.scrollIntoView({ block: "center" });
-    link.click();
-    return true;
-  });
-  if (!opened) return false;
-  await page
-    .waitForSelector("#clientInfoAddrZip_StreetAddress", { timeout: 10000 })
-    .catch(() => {});
-  await sleep(500);
+  if (!(await clientFormOpen(page))) {
+    const opened = await page.evaluate(() => {
+      const box = Array.from(document.querySelectorAll(".aboutbox")).find(
+        (b) =>
+          b.querySelector(".aboutbox__title")?.textContent.trim() === "Client:",
+      );
+      const link = box?.querySelector("a.aboutbox__link");
+      if (!link) return false;
+      link.scrollIntoView({ block: "center" });
+      link.click();
+      return true;
+    });
+    if (!opened) {
+      console.warn("Client box / edit link not found");
+      return false;
+    }
+    await page
+      .waitForSelector("#clientInfoAddrZip_StreetAddress", {
+        visible: true,
+        timeout: 10000,
+      })
+      .catch(() => {});
+    await sleep(800);
+  }
   const ok = await fillClientDobInOpenForm(page, mmddyyyy);
   await clickUpdateInfo(page);
   return ok;
 }
 
-// With the client info form already open, fill its DOB field.
 async function fillClientDobInOpenForm(page, mmddyyyy) {
   if (!mmddyyyy) return false;
-  // scope to the form/modal that holds the client address fields
   await page.evaluate(() => {
     document
       .querySelectorAll("[data-client-form]")
       .forEach((n) => n.removeAttribute("data-client-form"));
     const zip = document.querySelector("#clientInfoAddrZip_StreetAddress");
     const root =
-      zip?.closest(".modalbox__content, .modalbox, [role='dialog'], .sm-popup, form") ||
-      null;
+      zip?.closest(
+        ".modalbox__content, .modalbox, [role='dialog'], .sm-popup, form",
+      ) || null;
     if (root) root.setAttribute("data-client-form", "1");
   });
   const sel =
-    (await page.$("#clientInfoDateOfBirth").then((h) => (h ? "#clientInfoDateOfBirth" : null))) ||
+    (await page
+      .$("#clientInfoDateOfBirth")
+      .then((h) => (h ? "#clientInfoDateOfBirth" : null))) ||
     (await findDobInput(page, "[data-client-form]"));
   if (!sel) {
     console.warn("Client DOB input not found in client info form");
@@ -364,19 +398,21 @@ async function fillClientDobInOpenForm(page, mmddyyyy) {
 }
 
 async function clickUpdateInfo(page) {
-  await page.evaluate(() => {
+  const clicked = await page.evaluate(() => {
     const btn = Array.from(document.querySelectorAll("button.o-btn")).find(
-      (b) => b.textContent.trim() === "Update info",
+      (b) => b.textContent.trim() === "Update info" && b.offsetParent !== null,
     );
-    if (btn) {
-      btn.scrollIntoView({ block: "center" });
-      btn.click();
-    }
+    if (!btn) return false;
+    btn.scrollIntoView({ block: "center" });
+    btn.click();
+    return true;
   });
+  if (!clicked)
+    console.warn('"Update info" button not found (form may have closed)');
   await sleep(3000);
+  return clicked;
 }
 
-// Robustly fill an autocomplete that is just a number (e.g. yearsWithThisCarrier)
 async function fillNumericAutocomplete(page, sel, value) {
   await page.waitForSelector(sel, { timeout: 15000 });
   await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
@@ -389,12 +425,11 @@ async function fillNumericAutocomplete(page, sel, value) {
   await page.keyboard.press("Tab");
   await sleep(300);
 
-  let current = await page
+  const current = await page
     .$eval(sel, (el) => el.value || el.getAttribute("value") || "")
     .catch(() => "");
 
   if (current !== String(value)) {
-    // try dropdown click
     await page.evaluate((s) => {
       const input = document.querySelector(s);
       if (!input) return;
@@ -411,7 +446,6 @@ async function fillNumericAutocomplete(page, sel, value) {
         },
       )
       .catch(() => {});
-
     await page.evaluate((v) => {
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
       const candidates = [
@@ -430,8 +464,6 @@ async function fillNumericAutocomplete(page, sel, value) {
       }
     }, String(value));
     await sleep(250);
-
-    // force-set as last resort
     await page.evaluate(
       (s, v) => {
         const el = document.querySelector(s);
@@ -446,25 +478,363 @@ async function fillNumericAutocomplete(page, sel, value) {
     );
     await sleep(150);
   }
-
   await page.keyboard.press("Tab").catch(() => {});
   await sleep(150);
 }
 
-// Options tab → Policy History. Each of these is an autocomplete-style
-// input; plain typing shows the text but the app doesn't take it (that's
-// what caused "Required Policy History Years with Current Agency").
+// Clear any input: native setter "" + select-all + backspace
+async function clearInput(page, sel) {
+  await page
+    .$eval(sel, (el) => el.scrollIntoView({ block: "center" }))
+    .catch(() => {});
+  await page.focus(sel).catch(() => {});
+  await page.evaluate((s) => {
+    const el = document.querySelector(s);
+    if (!el) return;
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    ).set;
+    setter.call(el, "");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }, sel);
+  await page.click(sel, { clickCount: 3 }).catch(() => {});
+  await page.keyboard.down("Control").catch(() => {});
+  await page.keyboard.press("KeyA").catch(() => {});
+  await page.keyboard.up("Control").catch(() => {});
+  for (let i = 0; i < 12; i++)
+    await page.keyboard.press("Backspace").catch(() => {});
+  await sleep(150);
+}
+
+// Leave a date field without pressing Escape (Escape closes modals such
+// as the Client info form). Blur + Tab closes the calendar popup.
+async function leaveField(page, sel) {
+  await page.keyboard.press("Tab").catch(() => {});
+  await page.evaluate((s) => {
+    const el = document.querySelector(s);
+    if (!el) return;
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    el.dispatchEvent(new Event("blur", { bubbles: true }));
+    el.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+  }, sel);
+}
+
+// Masked date input (MM/DD/YYYY). Typing digit-by-digit races the mask and
+// loses characters (seen: "09181999" → "09/81/9"), so try in order:
+//   A) native value setter with the fully formatted value + events
+//   B) type the formatted value (with slashes) slowly
+//   C) type digits one at a time, pressing End before each one
+// Each attempt is verified after a pause (the app can reformat or clear).
+// opts.force: re-enter even if the box already shows the right date
+// opts.keyboardFirst: try real keystrokes before the native setter (the
+//   app only copies the Insured driver's DOB to the client record when it
+//   sees real key/blur events — the DOM value alone isn't enough)
+async function setDateInput(
+  page,
+  sel,
+  mmddyyyy,
+  { force = false, keyboardFirst = false } = {},
+) {
+  if (!mmddyyyy) return false;
+  await page.waitForSelector(sel, { visible: true, timeout: 10000 });
+  const digits = mmddyyyy.replace(/\D/g, "");
+  if (digits.length !== 8) {
+    console.warn(`setDateInput ${sel}: bad date "${mmddyyyy}"`);
+    return false;
+  }
+  const slashed = `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4)}`;
+  const read = () =>
+    page
+      .$eval(sel, (el) => (el.value || "").replace(/\D/g, ""))
+      .catch(() => "");
+
+  if (!force && (await read()) === digits) return true;
+
+  let strategies = [
+    [
+      "native-setter",
+      async () => {
+        await clearInput(page, sel);
+        await page.evaluate(
+          (s, v) => {
+            const el = document.querySelector(s);
+            if (!el) return;
+            el.focus();
+            const setter = Object.getOwnPropertyDescriptor(
+              HTMLInputElement.prototype,
+              "value",
+            ).set;
+            setter.call(el, v);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          },
+          sel,
+          slashed,
+        );
+      },
+    ],
+    [
+      "type-slashed",
+      async () => {
+        await clearInput(page, sel);
+        await page.focus(sel).catch(() => {});
+        await page.keyboard.type(slashed, { delay: 180 });
+      },
+    ],
+    [
+      "type-digit-by-digit",
+      async () => {
+        await clearInput(page, sel);
+        await page.focus(sel).catch(() => {});
+        for (const ch of digits) {
+          await page.keyboard.press("End").catch(() => {});
+          await page.keyboard.type(ch);
+          await sleep(220);
+        }
+      },
+    ],
+  ];
+
+  if (keyboardFirst) strategies = [strategies[1], strategies[2], strategies[0]];
+
+  for (const [name, run] of strategies) {
+    try {
+      await run();
+      await leaveField(page, sel);
+      await sleep(1200);
+      const got = await read();
+      if (got === digits) {
+        console.log(`setDateInput ${sel} = ${slashed} (via ${name})`);
+        return true;
+      }
+      console.warn(
+        `setDateInput ${sel}: wanted ${slashed}, got "${got}" via ${name}`,
+      );
+    } catch (e) {
+      console.warn(`setDateInput ${sel} ${name} error: ${e.message}`);
+    }
+  }
+  return false;
+}
+
+async function hasValue(page, sel, minDigits = 0) {
+  const v = await page
+    .$eval(sel, (el) => (el.value || "").trim())
+    .catch(() => "");
+  return minDigits ? v.replace(/\D/g, "").length >= minDigits : !!v;
+}
+
+async function fillSdipIfEmpty(page) {
+  await page.waitForSelector("#driverSdip", { visible: true, timeout: 5000 });
+  if (await hasValue(page, "#driverSdip")) {
+    console.log("SDIP already filled — leaving it as is");
+    return;
+  }
+  await page.type("#driverSdip", "00", { delay: 100 });
+  await page.keyboard.press("Tab");
+  await sleep(500);
+}
+
+async function saveQuote(page) {
+  const sel = "button.app-button.app-button--save-quote";
+  await page.waitForSelector(sel, { visible: true, timeout: 10000 });
+  await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
+  await page.click(sel, { delay: 50 });
+  await sleep(2000);
+}
+
+async function setTextInput(page, sel, value) {
+  await page.waitForSelector(sel, { visible: true, timeout: 10000 });
+  await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
+  await page.click(sel, { clickCount: 3 }).catch(() => {});
+  await page.keyboard.press("Backspace");
+  await page.keyboard.type(String(value), { delay: 100 });
+  await page.evaluate(
+    (s, v) => {
+      const el = document.querySelector(s);
+      if (!el) return;
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      ).set;
+      setter.call(el, v);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    },
+    sel,
+    String(value),
+  );
+  await page.keyboard.press("Tab");
+  await sleep(300);
+}
+
+async function ensureVehiclePrice(page) {
+  const sel = "#vehiclePriceValue";
+  if (!(await page.$(sel))) {
+    console.warn("Price New / Value field (#vehiclePriceValue) not found");
+    return false;
+  }
+  const current = await page.$eval(sel, (el) => (el.value || "").trim());
+  if (current) return true;
+  const disabled = await page
+    .$eval(sel, (el) => !!el.disabled)
+    .catch(() => false);
+  if (disabled) return true; // app controls it (VIN lookup) — nothing to type
+  const price = vehiclePriceNew || DEFAULT_PRICE_NEW;
+  if (!vehiclePriceNew)
+    console.warn(`No price in webhook — using default ${price}`);
+  await setTextInput(page, sel, price);
+  const after = await page.$eval(sel, (el) => (el.value || "").trim());
+  console.log(`Price New / Value now "${after}"`);
+  return !!after;
+}
+
+// Vehicle garaging zip — set and verify (it was ending up blank because
+// the city autocomplete re-renders the address block after zip is typed).
+async function ensureVehicleZip(page) {
+  const sel = "#vehicleLocationZip";
+  if (!locationZip || !(await page.$(sel))) return false;
+  for (let i = 1; i <= 3; i++) {
+    const v = await page
+      .$eval(sel, (el) => (el.value || "").replace(/\D/g, ""))
+      .catch(() => "");
+    if (v.startsWith(locationZip.replace(/\D/g, "").slice(0, 5))) return true;
+    await setTextInput(page, sel, locationZip);
+    await sleep(1500);
+  }
+  const final = await page.$eval(sel, (el) => el.value || "").catch(() => "");
+  console.warn(`Vehicle zip after retries: "${final}"`);
+  return !!final.trim();
+}
+
+// Gender + marital status on the (open) Drivers tab, only if empty.
+async function fillDriverDemographics(page) {
+  let ok = true;
+  if (
+    genderText &&
+    (await page.$("#driverGender")) &&
+    !(await hasValue(page, "#driverGender"))
+  ) {
+    const v = await fillSelectVerified(page, "#driverGender", genderText);
+    console.log(`Driver gender = "${v}"`);
+    if (!v) ok = false;
+  }
+  if (
+    maritalText &&
+    (await page.$("#driverMaritalStatus")) &&
+    !(await hasValue(page, "#driverMaritalStatus"))
+  ) {
+    let v = await fillSelectVerified(page, "#driverMaritalStatus", maritalText);
+    if (!v && maritalText !== "Single") {
+      v = await fillSelectVerified(page, "#driverMaritalStatus", "Single");
+    }
+    console.log(`Driver marital status = "${v}"`);
+    if (!v) ok = false;
+  }
+  return ok;
+}
+
+// Final check of the Drivers tab before moving on; re-fills anything that
+// didn't stick. Returns a list of problems (empty = all good).
+async function verifyDriverTab(page) {
+  const problems = [];
+  const dob = formatDateToMMDDYYYY(dobRaw);
+  if (dob && (await page.$("#driverDateOfBirth"))) {
+    const okDob =
+      (await hasValue(page, "#driverDateOfBirth", 8)) &&
+      (await page.$eval("#driverDateOfBirth", (el) =>
+        el.value.replace(/\D/g, ""),
+      )) === dob;
+    if (!okDob && !(await setDateInput(page, "#driverDateOfBirth", dob)))
+      problems.push("driver DOB");
+  }
+  if (effectiveFirstLicenseDate && (await page.$("#driverFirstLicensed"))) {
+    if (
+      !(await hasValue(page, "#driverFirstLicensed", 8)) &&
+      !(await setDateInput(
+        page,
+        "#driverFirstLicensed",
+        formatDateToMMDDYYYY(effectiveFirstLicenseDate),
+      ))
+    )
+      problems.push("first licensed");
+  }
+  if (!(await fillDriverDemographics(page))) problems.push("gender/marital");
+  if (problems.length)
+    console.warn("Driver tab still missing:", problems.join(", "));
+  return problems;
+}
+
+// Drivers tab must be open. Makes sure driver 1 is "Insured" (picked from
+// the dropdown, not just typed), then re-enters the DOB with real
+// keystrokes so SinglePoint copies it to the client record.
+async function syncInsuredDob(page) {
+  const dob = formatDateToMMDDYYYY(dobRaw);
+  if (!dob) return false;
+  const rel = await page
+    .$eval("#driverRelationshipToInsured", (el) => (el.value || "").trim())
+    .catch(() => "");
+  if (!/^insured$/i.test(rel)) {
+    const v = await fillSelectVerified(
+      page,
+      "#driverRelationshipToInsured",
+      "Insured",
+    );
+    console.log(`Relationship to insured = "${v}"`);
+    await sleep(800);
+  }
+  const ok = await setDateInput(page, "#driverDateOfBirth", dob, {
+    force: true,
+    keyboardFirst: true,
+  });
+  await sleep(1000);
+  console.log(`Insured DOB re-entered for client sync: ${ok}`);
+  return ok;
+}
+
+async function retry(label, fn, { attempts = 3, delay = 3000, between } = {}) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn(i);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`${label} failed (attempt ${i}/${attempts}): ${e.message}`);
+      if (i < attempts) {
+        await sleep(delay);
+        if (between) await between().catch(() => {});
+      }
+    }
+  }
+  throw lastErr;
+}
+
+const quoteUrl = () => {
+  try {
+    return $page.url();
+  } catch (_) {
+    return "unknown";
+  }
+};
+
+async function goToTab(page, name) {
+  await page.click(`.tabs__list .tabs__item a[href*="${name}"]`);
+  await sleep(1500);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  OPTIONS-TAB HELPERS
+// ─────────────────────────────────────────────────────────────
+
+// Policy History — autocomplete inputs (plain typing doesn't stick)
 const POLICY_HISTORY_FIELDS = [
   { sel: "#yearsWithThisCarrier", value: "6" },
   { sel: "#yearsWithCurrentAgency", value: "6" },
   { sel: "#lapsedDaysLast12Months", value: "0" },
-  // typed as before (this one already worked) — no dropdown guessing
   { sel: "#priorBodilyInjurylimits", value: "100/300", plain: true },
 ];
 
-// Fill every Policy History field (Options tab must be open). With
-// onlyEmpty=true, fields that already have a value are left alone.
-// Returns true if every field ends up with a value.
 async function fillPolicyHistory(page, { onlyEmpty = false } = {}) {
   let allOk = true;
   for (const f of POLICY_HISTORY_FIELDS) {
@@ -483,7 +853,9 @@ async function fillPolicyHistory(page, { onlyEmpty = false } = {}) {
       } else {
         await fillNumericAutocomplete(page, f.sel, f.value);
       }
-      const v = await page.$eval(f.sel, (el) => (el.value || "").trim()).catch(() => "");
+      const v = await page
+        .$eval(f.sel, (el) => (el.value || "").trim())
+        .catch(() => "");
       console.log(`Policy History ${f.sel} = "${v}"`);
       if (!v) allOk = false;
     } catch (e) {
@@ -494,7 +866,6 @@ async function fillPolicyHistory(page, { onlyEmpty = false } = {}) {
   return allOk;
 }
 
-// Click a custom checkbox and ensure it ends up checked
 async function ensureChecked(page, baseId) {
   const SEL_ITEM = `#${baseId}`;
   const SEL_INPUT = `#${baseId}_checkbox`;
@@ -505,13 +876,11 @@ async function ensureChecked(page, baseId) {
     el.scrollIntoView({ block: "center", inline: "center" }),
   );
 
-  // Already checked → clicking would toggle it OFF, so leave it alone
   const already = await page
     .$eval(SEL_INPUT, (el) => !!el.checked)
     .catch(() => false);
   if (already) return false;
 
-  // try icon click first
   try {
     await page.waitForSelector(SEL_ICON, { timeout: 2000 });
     await page.click(SEL_ICON, { delay: 20 });
@@ -524,7 +893,6 @@ async function ensureChecked(page, baseId) {
   let checked = await page
     .$eval(SEL_INPUT, (el) => !!el.checked)
     .catch(() => false);
-
   if (!checked) {
     await page.evaluate((s) => {
       const el = document.querySelector(s);
@@ -542,7 +910,6 @@ async function ensureChecked(page, baseId) {
       .$eval(SEL_INPUT, (el) => !!el.checked)
       .catch(() => false);
   }
-
   if (!checked) {
     const h =
       (await page.$(SEL_ICON)) ||
@@ -558,17 +925,24 @@ async function ensureChecked(page, baseId) {
   return true;
 }
 
-// Answers for known required Options items (matched by item title).
-// Anything not listed here gets the first radio in its modal.
 const REQUIRED_OPTION_ANSWERS = [
-  { match: /length of time for continuous coverage/i, answer: /36\s*\+\s*months?/, fallback: "last" },
-  { match: /travelers.*continuous insurance/i, answer: /less\s+than\s+3\s+years?/, fallback: "first" },
-  { match: /travelers.*primary residence type/i, answer: /^other$/, fallback: "first" },
+  {
+    match: /length of time for continuous coverage/i,
+    answer: /36\s*\+\s*months?/,
+    fallback: "last",
+  },
+  {
+    match: /travelers.*continuous insurance/i,
+    answer: /less\s+than\s+3\s+years?/,
+    fallback: "first",
+  },
+  {
+    match: /travelers.*primary residence type/i,
+    answer: /^other$/,
+    fallback: "first",
+  },
 ];
 
-// Find Options items shown in red (required) that are still unchecked.
-// Returns [{ baseId, title }]. Red is detected from the computed text color,
-// so it works no matter which carriers/items a given client shows.
 async function findRequiredUncheckedOptions(page) {
   return page.evaluate(() => {
     const isRed = (el) => {
@@ -596,7 +970,6 @@ async function findRequiredUncheckedOptions(page) {
   });
 }
 
-// Check every red/required Options item and answer its modal if one opens.
 async function handleRequiredOptions(page) {
   const attempts = {};
   for (let round = 0; round < 10; round++) {
@@ -604,23 +977,24 @@ async function handleRequiredOptions(page) {
       (o) => (attempts[o.baseId] || 0) < 2,
     );
     if (!pending.length) break;
-
     for (const { baseId, title } of pending) {
       attempts[baseId] = (attempts[baseId] || 0) + 1;
       console.log(`Options: required item → ${title || baseId}`);
       try {
         await ensureChecked(page, baseId);
-
         const hasModal = await page
           .waitForSelector('label.o-checkable input[name="parsedItemOption"]', {
             timeout: 4000,
           })
           .then(() => true)
           .catch(() => false);
-
         if (hasModal) {
           const rule = REQUIRED_OPTION_ANSWERS.find((r) => r.match.test(title));
-          await pickModalRadio(page, rule ? rule.answer : /(?!)/, rule ? rule.fallback : "first");
+          await pickModalRadio(
+            page,
+            rule ? rule.answer : /(?!)/,
+            rule ? rule.fallback : "first",
+          );
           await saveModal(page);
         }
         await sleep(500);
@@ -629,7 +1003,6 @@ async function handleRequiredOptions(page) {
       }
     }
   }
-
   const left = await findRequiredUncheckedOptions(page);
   if (left.length) {
     console.warn(
@@ -639,19 +1012,11 @@ async function handleRequiredOptions(page) {
   }
 }
 
-// Pick a radio in a modal by text regex, fallback to first/last
-async function pickModalRadio(
-  page,
-  textRegex,
-  fallback /* "first" | "last" */,
-) {
+async function pickModalRadio(page, textRegex, fallback) {
   await page.waitForSelector(
     'label.o-checkable input[name="parsedItemOption"]',
-    {
-      timeout: 15000,
-    },
+    { timeout: 15000 },
   );
-
   const picked = await page.evaluate(
     (reStr) => {
       const re = new RegExp(reStr, "i");
@@ -711,7 +1076,6 @@ async function pickModalRadio(
   }
 }
 
-// Click the Save button inside any currently-open modal
 async function saveModal(page) {
   await page.waitForSelector(".o-btn.u-spacing--right-2", { timeout: 10000 });
   await page.evaluate(() => {
@@ -723,7 +1087,6 @@ async function saveModal(page) {
       saveBtn.click();
     }
   });
-  // wait for modal to close
   await page
     .waitForFunction(
       () =>
@@ -735,21 +1098,10 @@ async function saveModal(page) {
     .catch(() => {});
 }
 
-// NEW: scan the premiums table for the first ENABLED "View plan summary"
-// button and click it. Confirmed from the live DOM:
-//   - Carriers like Progressive / Arbella get a $ premium tag + a
-//     "View plan summary" button once rated.
-//   - MAIP (CAR) and MAPFRE never get that button at all — they get a
-//     "Review" button instead (manual underwriting flow, out of scope
-//     for this automation).
-//   - Travelers (or others) that fail rating get an "Error" / "Review
-//     Error" button, also not a summary.
-// So there's no such thing as "waiting for MAIP to rate" — we just need
-// to wait for a carrier row to finish and expose "View plan summary".
+// ─────────────────────────────────────────────────────────────
+//  PREMIUMS-TAB HELPERS
+// ─────────────────────────────────────────────────────────────
 
-// Find (and optionally click) a visible, enabled button in a premiums row
-// whose label matches textRe. carrier limits it to that carrier's row;
-// excludeCarrier skips that carrier's row.
 async function rowButton(
   page,
   textRe,
@@ -795,14 +1147,6 @@ async function findAndOpenPlanSummary(page, carrier = null) {
   return rowButton(page, SUMMARY_RE, { carrier });
 }
 
-async function goToTab(page, name) {
-  await page.click(`.tabs__list .tabs__item a[href*="${name}"]`);
-  await sleep(1500);
-}
-
-// Debug snapshot of a tab: URL, open modals, and every visible input /
-// select with its id, name, label text and current value. Used to find the
-// real selectors when a fixer can't find or set a field.
 async function describeTab(page, name) {
   await goToTab(page, name);
   await sleep(1000);
@@ -813,168 +1157,38 @@ async function describeTab(page, name) {
       const t =
         byFor?.textContent ||
         el.closest("label")?.textContent ||
-        el.closest(".o-field, .form-group, tr, .row, div")?.querySelector("label, .o-label, th")
-          ?.textContent ||
+        el
+          .closest(".o-field, .form-group, tr, .row, div")
+          ?.querySelector("label, .o-label, th")?.textContent ||
         "";
       return t.replace(/\s+/g, " ").trim().slice(0, 60);
     };
     return {
       url: location.href,
       modals: Array.from(
-        document.querySelectorAll('.modalbox__content, [role="dialog"], .sm-popup.is-active'),
+        document.querySelectorAll(
+          '.modalbox__content, [role="dialog"], .sm-popup.is-active',
+        ),
       )
         .filter(visible)
         .map((m) => (m.innerText || "").replace(/\s+/g, " ").slice(0, 120)),
       fields: Array.from(document.querySelectorAll("input, select, textarea"))
-        .filter((el) => visible(el) && el.type !== "hidden")
-        .slice(0, 80)
+        .filter(
+          (el) => visible(el) && el.type !== "hidden" && (el.id || el.name),
+        )
+        .slice(0, 40)
         .map((el) => ({
           id: el.id || undefined,
           name: el.name || undefined,
-          cls: (el.className || "").toString().slice(0, 50) || undefined,
           label: labelOf(el) || undefined,
-          value: el.type === "checkbox" ? el.checked : (el.value || "").slice(0, 40),
+          value:
+            el.type === "checkbox" ? el.checked : (el.value || "").slice(0, 40),
           disabled: el.disabled || undefined,
         })),
     };
   });
 }
 
-// Clear + type into a datepicker input; returns true if a full date stuck
-// The date pickers are masked inputs: typing alone can show the date in the
-// box without the app's model taking it (so it's lost on save). Fire the
-// input/change/blur events the app listens for, close the calendar popup,
-// then re-read after a pause (the app may reformat or clear it) and retry.
-async function setDateInput(page, sel, mmddyyyy) {
-  if (!mmddyyyy) return false;
-  await page.waitForSelector(sel, { visible: true, timeout: 10000 });
-  const want = mmddyyyy.replace(/\D/g, "");
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
-    await page.click(sel, { clickCount: 3 }).catch(() => {});
-    for (let i = 0; i < 12; i++) await page.keyboard.press("Backspace");
-    await page.keyboard.type(mmddyyyy, { delay: 100 });
-    await page.evaluate((s) => {
-      const el = document.querySelector(s);
-      if (!el) return;
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    }, sel);
-    await page.keyboard.press("Escape").catch(() => {}); // close calendar
-    await page.keyboard.press("Tab").catch(() => {});
-    await page.evaluate((s) => {
-      document.querySelector(s)?.dispatchEvent(new Event("blur", { bubbles: true }));
-    }, sel);
-    await sleep(1200);
-    const got = await page
-      .$eval(sel, (el) => (el.value || "").replace(/\D/g, ""))
-      .catch(() => "");
-    if (got === want) return true;
-    console.warn(`setDateInput ${sel}: wanted ${mmddyyyy}, got "${got}" (attempt ${attempt})`);
-  }
-  return false;
-}
-
-// True if the field already has a value (at least `minDigits` digits when
-// given, e.g. 8 for a full date).
-async function hasValue(page, sel, minDigits = 0) {
-  const v = await page.$eval(sel, (el) => (el.value || "").trim()).catch(() => "");
-  return minDigits ? v.replace(/\D/g, "").length >= minDigits : !!v;
-}
-
-// SDIP: keep whatever is already there (e.g. "99" from RMV); type "00" only
-// when the field is empty.
-async function fillSdipIfEmpty(page) {
-  await page.waitForSelector("#driverSdip", { visible: true, timeout: 5000 });
-  if (await hasValue(page, "#driverSdip")) {
-    console.log("SDIP already filled — leaving it as is");
-    return;
-  }
-  await page.type("#driverSdip", "00", { delay: 100 });
-  await page.keyboard.press("Tab");
-  await sleep(500);
-}
-
-// Click "Save quote" on the Premiums tab so edits made after the first save
-// (e.g. by REVIEW_FIXERS) are persisted.
-async function saveQuote(page) {
-  const sel = "button.app-button.app-button--save-quote";
-  await page.waitForSelector(sel, { visible: true, timeout: 10000 });
-  await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
-  await page.click(sel, { delay: 50 });
-  await sleep(2000);
-}
-
-// Clear + type into a plain text input and fire input/change events
-// Fill Price New / Value on the (already open) Vehicles tab if it's empty.
-// Returns true if the field ends up with a value.
-async function ensureVehiclePrice(page) {
-  const sel = "#vehiclePriceValue";
-  const exists = await page.$(sel);
-  if (!exists) {
-    console.warn("Price New / Value field (#vehiclePriceValue) not found");
-    return false;
-  }
-  const current = await page.$eval(sel, (el) => (el.value || "").trim());
-  if (current) return true;
-  const price = vehiclePriceNew || DEFAULT_PRICE_NEW;
-  if (!vehiclePriceNew)
-    console.warn(`No price in webhook — using default Price New / Value ${price}`);
-  await setTextInput(page, sel, price);
-  const after = await page.$eval(sel, (el) => (el.value || "").trim());
-  console.log(`Price New / Value now "${after}"`);
-  return !!after;
-}
-
-async function setTextInput(page, sel, value) {
-  await page.waitForSelector(sel, { visible: true, timeout: 10000 });
-  await page.$eval(sel, (el) => el.scrollIntoView({ block: "center" }));
-  await page.click(sel, { clickCount: 3 }).catch(() => {});
-  await page.keyboard.press("Backspace");
-  await page.keyboard.type(String(value), { delay: 100 });
-  await page.evaluate(
-    (s, v) => {
-      const el = document.querySelector(s);
-      if (!el) return;
-      el.value = v;
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    },
-    sel,
-    String(value),
-  );
-  await page.keyboard.press("Tab");
-  await sleep(300);
-}
-
-// Run `fn` up to `attempts` times inside the SAME browser session (so no new
-// quote is created). Between attempts runs `between` (e.g. re-open a tab).
-async function retry(label, fn, { attempts = 3, delay = 3000, between } = {}) {
-  let lastErr;
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      return await fn(i);
-    } catch (e) {
-      lastErr = e;
-      console.warn(`${label} failed (attempt ${i}/${attempts}): ${e.message}`);
-      if (i < attempts) {
-        await sleep(delay);
-        if (between) await between().catch(() => {});
-      }
-    }
-  }
-  throw lastErr;
-}
-
-const quoteUrl = () => {
-  try {
-    return $page.url();
-  } catch (_) {
-    return "unknown";
-  }
-};
-
-// Rate All Plans, retried: re-opens the Premiums tab between attempts.
 async function clickRateAllPlans(page) {
   return retry("Rate All Plans", () => clickRateAllPlansOnce(page), {
     between: async () => {
@@ -1007,7 +1221,6 @@ async function clickRateAllPlansOnce(page) {
   await el.click();
 }
 
-// Snapshot of each premiums row: carrier text + visible button labels
 async function getPremiumRowStates(page) {
   return page.evaluate(() =>
     Array.from(document.querySelectorAll("table.table tbody tr")).map(
@@ -1024,9 +1237,6 @@ async function getPremiumRowStates(page) {
   );
 }
 
-// Poll until the premiums table stops changing (every row settled on
-// Summary/Review/Rate/Error). Returns early once one of `carriers` (or any
-// row, if null) exposes "View plan summary". Does not click anything.
 async function waitForRatingSettled(page, carriers = null, maxMs = 180000) {
   const start = Date.now();
   let lastSig = "";
@@ -1045,14 +1255,12 @@ async function waitForRatingSettled(page, carriers = null, maxMs = 180000) {
   return false;
 }
 
-// Open each row's "Review" modal, collect the warning lines, close it.
 const REVIEW_MODAL_SEL =
   '.modalbox__content, .modalbox, [role="dialog"], .sm-popup.is-active';
 
 async function collectReviewWarnings(page, carrier = null) {
   const rowCount = await page.$$eval("table.table tbody tr", (r) => r.length);
   const warnings = new Set();
-
   for (let i = 0; i < rowCount; i++) {
     const opened = await page.evaluate(
       (idx, carrier) => {
@@ -1121,7 +1329,6 @@ async function collectReviewWarnings(page, carrier = null) {
     }, REVIEW_MODAL_SEL);
     lines.forEach((l) => warnings.add(l));
 
-    // close the modal
     await page.evaluate((sel) => {
       const modal = Array.from(document.querySelectorAll(sel))
         .filter(
@@ -1151,7 +1358,6 @@ async function collectReviewWarnings(page, carrier = null) {
       .catch(() => {});
     await sleep(500);
   }
-
   return Array.from(warnings);
 }
 
@@ -1159,15 +1365,26 @@ async function collectReviewWarnings(page, carrier = null) {
 //  1.  INPUT DATA
 // ─────────────────────────────────────────────────────────────
 
-const USERNAME = "agent1";
-const PASSWORD = "Singapore@2025";
+// SinglePoint login. Prefer n8n environment variables (SPR_USERNAME /
+// SPR_PASSWORD). If env access is blocked on your instance, paste the
+// values below — and rotate the password, it was stored in plain text.
+const readEnv = (k) => {
+  try {
+    return (typeof $env !== "undefined" && $env && $env[k]) || "";
+  } catch (_) {
+    return "";
+  }
+};
+const USERNAME = readEnv("SPR_USERNAME") || "agent1";
+const PASSWORD = readEnv("SPR_PASSWORD") || "Singapore@2025";
+if (PASSWORD === "REPLACE_WITH_SPR_PASSWORD")
+  throw new Error(
+    "SinglePoint password not configured (set SPR_PASSWORD or edit the script)",
+  );
 
-// NOTE: the webhook payload has no top-level "type" field (fields live
-// under $json.body). $json.type will always be undefined, so this used to
-// silently fall back to "auto" every time — correct for this form by
-// coincidence, not by design. Deriving from form_id makes it correct on
-// purpose and safe if other form_ids ever get routed through this node.
-const formId = String($json.body?.form_id || "").toUpperCase();
+const B = $json.body || {};
+
+const formId = String(B.form_id || "").toUpperCase();
 const INSURANCE_TYPE =
   $json.type ||
   (formId.startsWith("AUTO")
@@ -1180,70 +1397,93 @@ const INSURANCE_TYPE =
           ? "umbrella"
           : "auto");
 
-const licenseNo = String($json.body?.d1_lic_num || "").trim();
-const firstName = String($json.body?.first_name || "").trim();
-const lastName = String($json.body?.last_name || "").trim();
-const dobRaw = String($json.body?.d1_dob || "").trim();
-const firstLicenseDate = String($json.body?.d1_lic_date || "").trim();
-const licenseState = String($json.body?.d1_lic_state || "").trim();
-const vehicleVin = String($json.body?.v1_vin || "").trim();
-const vehicleYear = String($json.body?.v1_year || "2016").trim();
-const vehicleMake = String($json.body?.v1_make || "Subaru").trim();
-const vehicleModel = String($json.body?.v1_model || "OUTBACK").trim();
-// NOTE: the current webhook payload does not send step_5_reg_type_1 at all
-// (checked against a live sample) — it only sends v1_year/v1_make/v1_model.
-// v1_trim is included as an alt name in case the form is updated later.
-// If both are missing, vehicleTrim stays "" and the Vehicles-tab logic
-// below now falls back to selecting the first available trim option
-// instead of typing an empty string into the autocomplete.
-const vehicleTrim = String(
-  $json.body?.v1_trim || $json.body?.step_5_reg_type_1 || "",
-).trim();
-const vehicleBody = String($json.body?.v1_body || "").trim(); // e.g. "Sedan"
-// Price New / Value: the webhook doesn't send one today, and the VIN lookup
-// doesn't always fill it (e.g. Tesla). Use a webhook value if one appears,
-// otherwise this default — CHANGE IT if you want a different assumption.
-const DEFAULT_PRICE_NEW = "60000";
-const vehiclePriceNew = String(
-  $json.body?.v1_price_new || $json.body?.v1_price || $json.body?.v1_value || "",
-).replace(/[^\d]/g, "");
-const vehicleZip = String($json.body?.v1_zip || "").trim();
-const address1 = String($json.body?.residential_address || "").trim();
-const city = String(
-  $json.body?.step_1_data?.city || $json.body?.city || "",
-).trim();
-const state = String($json.body?.state || "").trim();
-const zip = String($json.body?.zip || vehicleZip).trim();
-const email = String($json.body?.email || "").trim();
-const agentCode = String($json.body?.agent_code || $json.agent_code || "")
+const licenseNo = String(B.d1_lic_num || "")
   .trim()
   .toUpperCase();
-// Agent JRN always wants a MAIP plan; others keep the default priority.
+const firstName = String(B.d1_first || B.first_name || "").trim();
+const lastName = String(B.d1_last || B.last_name || "").trim();
+const dobRaw = String(B.d1_dob || "").trim();
+const firstLicenseDate = String(B.d1_lic_date || "").trim();
+const licenseState = String(B.d1_lic_state || "")
+  .trim()
+  .toUpperCase();
+const vehicleVin = String(B.v1_vin || "").trim();
+const vehicleYear = String(B.v1_year || "2016").trim();
+const vehicleMake = String(B.v1_make || "Subaru").trim();
+const vehicleModel = String(B.v1_model || "OUTBACK").trim();
+const vehicleTrim = String(B.v1_trim || B.step_5_reg_type_1 || "").trim();
+const vehicleBody = String(B.v1_body || "")
+  .split("/")[0]
+  .trim(); // "SUV / Crossover" → "SUV"
+const DEFAULT_PRICE_NEW = "60000";
+const vehiclePriceNew = String(
+  B.v1_price_new || B.v1_price || B.v1_value || "",
+).replace(/[^\d]/g, "");
+const vehicleZip = String(B.v1_zip || "").trim();
+const address1 = String(B.residential_address || "").trim();
+const city = String(B.step_1_data?.city || B.city || "").trim();
+const state = String(B.state || "")
+  .trim()
+  .toUpperCase();
+const zip = String(B.zip || vehicleZip).trim();
+const email = String(B.email || "").trim();
+const agentCode = String(B.agent_code || $json.agent_code || "")
+  .trim()
+  .toUpperCase();
 const IS_JRN = agentCode === "JRN";
-
-// Vehicle garaging zip: fall back to the client zip when v1_zip is missing
-// (that empty value is what produced "Zip Code not set for <vehicle>").
 const locationZip = vehicleZip || zip;
 
-// First Licensed is required by every carrier. When the webhook doesn't
-// send d1_lic_date, assume DOB + 18 years (capped at today) so rating can
-// proceed — the quote will reflect that assumption.
+// Gender / marital as SinglePoint labels
+const genderText =
+  { male: "Male", female: "Female", m: "Male", f: "Female" }[
+    String(B.d1_gender || "")
+      .trim()
+      .toLowerCase()
+  ] || "";
+const maritalText = (() => {
+  const m = String(B.d1_marital || "")
+    .trim()
+    .toLowerCase();
+  if (!m) return "";
+  if (/not married|single|never/.test(m)) return "Single";
+  if (/divorc/.test(m)) return "Divorced";
+  if (/widow/.test(m)) return "Widowed";
+  if (/separat/.test(m)) return "Separated";
+  if (/partner|civil/.test(m)) return "Domestic Partner";
+  if (/married/.test(m)) return "Married";
+  return "Single";
+})();
+
+// Prior carrier / expiration from the form, with safe fallbacks
+const priorCarrier = String(B.prior_carrier || "").trim();
+const priorExpRaw = String(B.prior_exp || "").trim();
+
 function deriveFirstLicenseDate(dob) {
-  const d = new Date(dob);
-  if (isNaN(d.getTime())) return "";
-  d.setFullYear(d.getFullYear() + 18);
+  const m = String(dob).match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (!m) return "";
+  const d = new Date(Number(m[1]) + 18, Number(m[2]) - 1, Number(m[3]));
   const now = new Date();
   const use = d > now ? now : d;
-  return `${use.getMonth() + 1}/${use.getDate()}/${use.getFullYear()}`;
+  return `${use.getFullYear()}-${String(use.getMonth() + 1).padStart(2, "0")}-${String(use.getDate()).padStart(2, "0")}`;
 }
 const effectiveFirstLicenseDate =
   firstLicenseDate || deriveFirstLicenseDate(dobRaw);
 if (!firstLicenseDate)
   console.warn(
-    `d1_lic_date missing — using derived First Licensed date ${effectiveFirstLicenseDate}`,
+    `d1_lic_date missing — using derived First Licensed ${effectiveFirstLicenseDate}`,
   );
 
 if (!licenseNo) throw new Error("Missing d1_lic_num in input JSON");
+if (!formatDateToMMDDYYYY(dobRaw))
+  throw new Error(`Missing/invalid d1_dob "${dobRaw}"`);
+
+// MA licences start with "S" (S + 8 digits, or "SA" + 7). Only those can
+// use the RMV lookup; everything else (out-of-state) is entered manually.
+const isRmvFlow =
+  (!licenseState || licenseState === "MA") && /^S/.test(licenseNo);
+console.log(
+  `Licence ${licenseState} ${licenseNo} → ${isRmvFlow ? "RMV lookup" : "manual entry"} flow`,
+);
 
 // ─────────────────────────────────────────────────────────────
 //  2.  LOGIN
@@ -1254,9 +1494,6 @@ await $page.goto("https://apps.singlepointrating.com/webapps/sprapp/#/login", {
   timeout: 30000,
 });
 
-// The SPA renders the form after networkidle2, and the field name casing
-// isn't guaranteed — match loosely. If a previous session is still active
-// the app skips the login form and lands on the dashboard (.sidebox).
 const USER_SEL =
   'input[name="UserName" i], input#UserName, input[name="login" i], input[type="email"], form input[type="text"]';
 const PASS_SEL = 'input[name="Password" i], input[type="password"]';
@@ -1278,13 +1515,7 @@ const loginState = await $page
 
 if (!loginState) {
   const debug = await $page
-    .evaluate(() => ({
-      url: location.href,
-      title: document.title,
-      inputs: Array.from(document.querySelectorAll("input")).map(
-        (i) => `${i.tagName} name=${i.name} id=${i.id} type=${i.type}`,
-      ),
-    }))
+    .evaluate(() => ({ url: location.href, title: document.title }))
     .catch(() => ({}));
   throw new Error(
     `Login form not found after 45s. Page state: ${JSON.stringify(debug)}`,
@@ -1294,11 +1525,9 @@ if (!loginState) {
 if (loginState === "form") {
   await $page.click(USER_SEL, { clickCount: 3 }).catch(() => {});
   await $page.type(USER_SEL, USERNAME, { delay: 30 });
-
   await $page.waitForSelector(PASS_SEL, { visible: true, timeout: 10000 });
   await $page.click(PASS_SEL, { clickCount: 3 }).catch(() => {});
   await $page.type(PASS_SEL, PASSWORD, { delay: 30 });
-
   await Promise.all([
     $page.click("button.o-btn.o-btn--large"),
     $page
@@ -1324,17 +1553,15 @@ if (btnIndex === undefined)
 await buttons[btnIndex].click();
 console.log(`Clicked insurance type: ${INSURANCE_TYPE}`);
 
-await sleep(10000); // allow page to fully load after type selection
+await $page.waitForSelector(".sm-popup.is-active", { timeout: 30000 });
+await sleep(1500);
 
 // ─────────────────────────────────────────────────────────────
-//  4.  DRIVER TAB — branch on license prefix
+//  4.  DRIVER TAB
 // ─────────────────────────────────────────────────────────────
-
-const isRmvFlow = licenseNo.toUpperCase().startsWith("S");
 
 if (isRmvFlow) {
   // ── 4A. RMV LOOKUP FLOW ──────────────────────────────────
-  await $page.waitForSelector(".sm-popup.is-active", { timeout: 30000 });
   await $page.evaluate(() => {
     const container = document.querySelector(".sm-popup.is-active");
     if (!container) return;
@@ -1349,16 +1576,24 @@ if (isRmvFlow) {
   await $page.type("#lastName0", lastName, { delay: 30 });
   await $page.type("#licenseNumber0", licenseNo, { delay: 30 });
 
-  const dobFormatted = formatDateToMMDDYYYY(dobRaw);
-  await $page.click("input.datepicker-input__input", { clickCount: 3 });
-  await $page.keyboard.type(dobFormatted, { delay: 150 });
-  await $page.keyboard.press("Tab");
+  // RMV lookup DOB — same masked input, use the robust setter
+  await $page.evaluate(() => {
+    document
+      .querySelectorAll("[data-rmv-dob]")
+      .forEach((n) => n.removeAttribute("data-rmv-dob"));
+    const el = document.querySelector("input.datepicker-input__input");
+    if (el) el.setAttribute("data-rmv-dob", "1");
+  });
+  const rmvDobOk = await setDateInput(
+    $page,
+    "[data-rmv-dob]",
+    formatDateToMMDDYYYY(dobRaw),
+  );
+  if (!rmvDobOk) console.warn("RMV lookup DOB did not stick");
 
-  // submit RMV lookup
   await $page.click('button[type="submit"].o-btn');
   await sleep(6000);
 
-  // poll up to 90s for "Go to Quote" button then click it
   const maxMs = 90000;
   const start = Date.now();
   let goClicked = false;
@@ -1377,21 +1612,16 @@ if (isRmvFlow) {
       }
       return false;
     });
-    if (goClicked) {
-      console.log('Clicked "Go To Quote"');
-      break;
-    }
+    if (goClicked) break;
     await sleep(1000);
   }
+  if (!goClicked)
+    throw new Error(`RMV lookup never returned "Go to Quote" for ${licenseNo}`);
 
-  await sleep(1000);
-
-  // handle the confirmation modal if it appears
   await $page
     .waitForSelector(".modalbox__content.u-width-500px", { timeout: 30000 })
     .catch(() => {});
   await sleep(1000);
-
   for (let attempt = 0; attempt < 2; attempt++) {
     const clicked = await $page.evaluate(() => {
       const modal = document.querySelector(".modalbox__content.u-width-500px");
@@ -1406,54 +1636,24 @@ if (isRmvFlow) {
       }
       return false;
     });
-    if (clicked) {
-      console.log('Clicked "Go To Quote" in modal');
-      break;
-    }
+    if (clicked) break;
     await sleep(2000);
   }
 
-  await sleep(10000);
-
-  // driver relationship & first licensed (post-RMV page)
   await $page.waitForSelector("#driverRelationshipToInsured", {
-    timeout: 15000,
+    timeout: 30000,
   });
+  await sleep(4000); // let RMV data finish populating
+
   await $page.click("#driverRelationshipToInsured", { clickCount: 3 });
   await $page.keyboard.press("Backspace");
   await $page.keyboard.type("Insured", { delay: 100 });
   await $page.keyboard.press("Tab");
 
-  // RMV may already have filled First Licensed — only set it if empty
-  if (effectiveFirstLicenseDate && !(await hasValue($page, "#driverFirstLicensed", 8))) {
-    await setDateInput(
-      $page,
-      "#driverFirstLicensed",
-      formatDateToMMDDYYYY(effectiveFirstLicenseDate),
-    );
-  }
-
   await fillSdipIfEmpty($page);
-
-  // RMV data can finish loading after we typed and blank First Licensed —
-  // re-check and set it again if needed.
-  if (effectiveFirstLicenseDate) {
-    const fl = await $page
-      .$eval("#driverFirstLicensed", (el) => (el.value || "").trim())
-      .catch(() => "");
-    if (fl.replace(/\D/g, "").length < 8) {
-      console.warn(`First Licensed was cleared ("${fl}") — setting it again`);
-      const ok = await setDateInput(
-        $page,
-        "#driverFirstLicensed",
-        formatDateToMMDDYYYY(effectiveFirstLicenseDate),
-      );
-      if (!ok) console.warn("First Licensed still not set after retry");
-    }
-  }
+  await verifyDriverTab($page);
 } else {
-  // ── 4B. MANUAL ENTRY FLOW ────────────────────────────────
-  await $page.waitForSelector(".sm-popup.is-active", { timeout: 30000 });
+  // ── 4B. MANUAL ENTRY FLOW (out-of-state licences) ────────
   await $page.evaluate(() => {
     const container = document.querySelector(".sm-popup.is-active");
     if (!container) return;
@@ -1466,20 +1666,21 @@ if (isRmvFlow) {
   await $page.waitForSelector("#driverFirstName", { timeout: 15000 });
   await $page.type("#driverFirstName", firstName, { delay: 100 });
   await sleep(100);
-  await $page.type("#driverLastName", lastName, { delay: 150 });
-  await sleep(100);
+  await $page.type("#driverLastName", lastName, { delay: 120 });
+  await $page.keyboard.press("Tab");
+  await sleep(800); // let the form settle before the masked DOB field
 
   const dobFormatted = formatDateToMMDDYYYY(dobRaw);
   const dobOk = await setDateInput($page, "#driverDateOfBirth", dobFormatted);
-  if (!dobOk) console.warn(`Driver DOB did not stick (${dobFormatted})`);
+  if (!dobOk)
+    console.warn(`Driver DOB did not stick (${dobFormatted}) — will re-check`);
 
   await $page.waitForSelector("#driverRelationshipToInsured", {
     timeout: 10000,
   });
-  await $page.click("#driverRelationshipToInsured", { clickCount: 3 });
-  await $page.keyboard.press("Backspace");
-  await $page.keyboard.type("Insured", { delay: 100 });
-  await $page.keyboard.press("Tab");
+  // Relationship must be Insured BEFORE the DOB is (re)entered so the app
+  // copies driver 1's DOB to the client record.
+  await syncInsuredDob($page);
 
   if (effectiveFirstLicenseDate) {
     await setDateInput(
@@ -1489,19 +1690,28 @@ if (isRmvFlow) {
     );
   }
 
-  await $page.focus("#driverLicenseNumber");
-  await $page.type("#driverLicenseNumber", licenseNo, { delay: 150 });
-  await $page.keyboard.press("Tab");
+  await setTextInput($page, "#driverLicenseNumber", licenseNo);
 
   await $page.waitForSelector("#driverCurrentLicenseState", { timeout: 10000 });
-  await $page.click("#driverCurrentLicenseState", { clickCount: 3 });
-  await $page.keyboard.press("Backspace");
-  await $page.keyboard.type(licenseState, { delay: 100 });
-  await $page.keyboard.press("Tab");
+  const lsVal = await fillSelectVerified(
+    $page,
+    "#driverCurrentLicenseState",
+    licenseState,
+  );
+  if (!lsVal) console.warn(`Licence state "${licenseState}" did not stick`);
 
   await fillSdipIfEmpty($page);
 
-  // Update client address info
+  // Re-check DOB / First Licensed / gender / marital before leaving
+  const driverProblems = await verifyDriverTab($page);
+  if (driverProblems.includes("driver DOB")) {
+    const diag = await describeTab($page, "drivers").catch((e) => e.message);
+    throw new Error(
+      `Driver DOB could not be set (${dobFormatted}). Quote: ${quoteUrl()} DIAGNOSTICS: ${JSON.stringify(diag)}`,
+    );
+  }
+
+  // Client info: address + DOB
   await $page.waitForSelector(".aboutbox__title", { timeout: 10000 });
   await $page.evaluate(() => {
     const box = Array.from(document.querySelectorAll(".aboutbox")).find(
@@ -1517,60 +1727,46 @@ if (isRmvFlow) {
   });
 
   await $page.waitForSelector("#clientInfoAddrAddr1_StreetAddress", {
+    visible: true,
     timeout: 10000,
   });
-  await $page.click("#clientInfoAddrAddr1_StreetAddress", { clickCount: 3 });
-  await $page.keyboard.press("Backspace");
-  await $page.keyboard.type(address1 || city, { delay: 100 });
+  await sleep(500);
+  await setTextInput(
+    $page,
+    "#clientInfoAddrAddr1_StreetAddress",
+    address1 || city,
+  );
+  await setTextInput($page, "#clientInfoAddrCity_StreetAddress", city);
 
-  await $page.waitForSelector("#clientInfoAddrCity_StreetAddress", {
-    timeout: 10000,
-  });
-  await $page.click("#clientInfoAddrCity_StreetAddress", { clickCount: 3 });
-  await $page.keyboard.press("Backspace");
-  await $page.keyboard.type(city, { delay: 100 });
-
-  await $page.waitForSelector("#clientInfoAddrState_StreetAddress", {
-    timeout: 10000,
-  });
   await $page.click("#clientInfoAddrState_StreetAddress", { clickCount: 3 });
   await $page.keyboard.press("Backspace");
   await $page.keyboard.type(state, { delay: 100 });
   await $page.keyboard.press("Tab");
 
-  await $page.waitForSelector("#clientInfoAddrZip_StreetAddress", {
-    timeout: 10000,
-  });
-  await $page.click("#clientInfoAddrZip_StreetAddress", { clickCount: 3 });
-  await $page.keyboard.press("Backspace");
-  await $page.keyboard.type(zip, { delay: 100 });
+  await setTextInput($page, "#clientInfoAddrZip_StreetAddress", zip);
 
-  // Client DOB (otherwise: "Required Date of Birth for client.")
-  await fillClientDobInOpenForm($page, formatDateToMMDDYYYY(dobRaw)).catch(
-    (e) => console.warn("Client DOB fill failed:", e.message),
-  );
+  const clientDobOk = await fillClientDobInOpenForm(
+    $page,
+    formatDateToMMDDYYYY(dobRaw),
+  ).catch((e) => {
+    console.warn("Client DOB fill failed:", e.message);
+    return false;
+  });
 
-  await $page.waitForSelector("button.o-btn", {
-    visible: true,
-    timeout: 10000,
-  });
-  await $page.evaluate(() => {
-    const btn = Array.from(document.querySelectorAll("button.o-btn")).find(
-      (b) => b.textContent.trim() === "Update info",
-    );
-    if (!btn) throw new Error("Update info button not found");
-    btn.scrollIntoView({ block: "center" });
-    btn.click();
-  });
-  await sleep(5000);
+  await clickUpdateInfo($page);
+
+  // If the client DOB didn't stick in the form, try once more via the box
+  if (!clientDobOk) {
+    console.warn("Client DOB not confirmed — retrying via Client box");
+    await setClientDob($page, formatDateToMMDDYYYY(dobRaw)).catch(() => false);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
-//  5.  VEHICLES TAB
+//  5.  VEHICLES TAB  (vehicle 1 only — see note in result)
 // ─────────────────────────────────────────────────────────────
 
-await $page.click('.tabs__list .tabs__item a[href*="vehicles"]');
-await sleep(1000);
+await goToTab($page, "vehicles");
 
 if (vehicleVin) {
   await $page.waitForSelector("#vehicleVin", { timeout: 10000 });
@@ -1578,77 +1774,46 @@ if (vehicleVin) {
   await $page.keyboard.press("Backspace");
   await $page.keyboard.type(vehicleVin, { delay: 100 });
   await $page.keyboard.press("Tab");
-  await sleep(500);
+  await sleep(3000); // VIN lookup fills year/make/model/trim
 } else {
-  // Year → Make → Model → Trim (select-like dropdowns)
   await fillSelectLike($page, "#vehicleYear", vehicleYear);
   await fillSelectLike($page, "#vehicleMake", vehicleMake);
   await fillSelectLike($page, "#vehicleModel", vehicleModel);
   await sleep(700);
-
-  // Trim: only try to match by name if we actually have a value. If the
-  // webhook didn't send one (current form doesn't), pick the first
-  // available option instead of typing "" — that was leaving the field in
-  // an inconsistent state that could break rating downstream.
   if (vehicleTrim) {
     let trimPicked = await fillSelectLike($page, "#vehicleTrim", vehicleTrim);
-    if (!trimPicked) {
-      await sleep(800);
+    if (!trimPicked)
       trimPicked = await fillSelectLike($page, "#vehicleTrim", vehicleTrim);
-    }
-    if (!trimPicked) {
-      console.warn(
-        "Could not select trim by name, falling back to first available option:",
-        vehicleTrim,
-      );
-      await selectFirstAvailableOption($page, "#vehicleTrim");
-    }
+    if (!trimPicked) await selectFirstAvailableOption($page, "#vehicleTrim");
   } else {
-    // No trim in the webhook — prefer a trim matching the body style
-    // (v1_body, e.g. "Sedan"), else the first one. Selecting a trim is what
-    // fills VIN pattern, body style, Price New/Value and symbols.
-    console.warn(
-      `No trim value supplied by webhook — picking a trim${vehicleBody ? ` matching "${vehicleBody}"` : ""}.`,
+    const trimValue = await selectOptionPreferring(
+      $page,
+      "#vehicleTrim",
+      vehicleBody,
     );
-    const trimValue = await selectOptionPreferring($page, "#vehicleTrim", vehicleBody);
     if (!trimValue) console.warn("Trim still empty after selection attempts");
   }
 }
 
-// Vehicle location
-await $page.waitForSelector("#vehicleLocationAddress1", { timeout: 10000 });
-await $page.click("#vehicleLocationAddress1", { clickCount: 3 });
-await $page.keyboard.press("Backspace");
-await $page.keyboard.type(address1, { delay: 100 });
+// Garaging address — zip first, then city only if the zip lookup left it empty
+await setTextInput($page, "#vehicleLocationAddress1", address1);
+await ensureVehicleZip($page);
+if (!(await hasValue($page, "#vehicleLocationCity"))) {
+  await $page.click("#vehicleLocationCity", { clickCount: 3 });
+  await $page.keyboard.press("Backspace");
+  await $page.keyboard.type(city, { delay: 100 });
+  await $page.keyboard.press("Tab");
+  await sleep(800);
+}
+await ensureVehicleZip($page); // city autocomplete can wipe the zip
 
-await $page.waitForSelector("#vehicleLocationCity", { timeout: 10000 });
-await $page.click("#vehicleLocationCity", { clickCount: 3 });
-await $page.keyboard.press("Backspace");
-await $page.keyboard.type(city, { delay: 100 });
+await setTextInput($page, "#vehicleAnnualMiles", "10000");
+await sleep(500);
 
-await $page.waitForSelector("#vehicleLocationZip", { timeout: 10000 });
-await $page.click("#vehicleLocationZip", { clickCount: 3 });
-await $page.keyboard.press("Backspace");
-await $page.keyboard.type(locationZip, { delay: 100 });
-await $page.evaluate((v) => {
-  const input = document.querySelector("#vehicleLocationZip");
-  if (!input) return;
-  input.value = v;
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-  input.dispatchEvent(new Event("change", { bubbles: true }));
-}, locationZip);
-
-await $page.waitForSelector("#vehicleAnnualMiles", { timeout: 10000 });
-await $page.click("#vehicleAnnualMiles", { clickCount: 3 });
-await $page.keyboard.press("Backspace");
-await $page.keyboard.type("10000", { delay: 100 });
-await $page.keyboard.press("Tab");
-await sleep(1000);
-
-// Price New / Value — not always filled by the VIN/trim lookup
 await ensureVehiclePrice($page).catch((e) =>
   console.warn("Price New / Value fill failed:", e.message),
 );
+
 // ─────────────────────────────────────────────────────────────
 //  6.  OPTIONS TAB
 // ─────────────────────────────────────────────────────────────
@@ -1663,55 +1828,63 @@ await $page.$eval("#priorOrRenewingCarrier", (el) =>
 );
 await sleep(500);
 
-// 6-1. Prior carrier
-await fillSelectLike($page, "#priorOrRenewingCarrier", "Other");
-
-// 6-2. Prior expiry date (1 year from today)
-const nextYear = new Date();
-nextYear.setFullYear(nextYear.getFullYear() + 1);
-const expiryMMDDYYYY = formatDateToMMDDYYYY(
-  `${String(nextYear.getMonth() + 1).padStart(2, "0")}/${String(nextYear.getDate()).padStart(2, "0")}/${nextYear.getFullYear()}`,
-);
-if (expiryMMDDYYYY) {
-  await $page.waitForSelector("input.datepicker-input__input", {
-    visible: true,
-    timeout: 10000,
-  });
-  await $page
-    .click("input.datepicker-input__input", { clickCount: 3 })
-    .catch(() => {});
-  for (let i = 0; i < 12; i++) {
-    try {
-      await $page.keyboard.press("Backspace");
-    } catch (_) {}
-  }
-  await $page.keyboard.type(expiryMMDDYYYY, { delay: 120 });
-  await $page.keyboard.press("Tab");
+// 6-1. Prior carrier: form value if SinglePoint has it, else "Other"
+let carrierSet = "";
+if (priorCarrier && B.curr_insured !== "no") {
+  carrierSet = await fillSelectVerified(
+    $page,
+    "#priorOrRenewingCarrier",
+    priorCarrier,
+    { attempts: 1 },
+  );
 }
+if (!carrierSet)
+  carrierSet = await fillSelectVerified(
+    $page,
+    "#priorOrRenewingCarrier",
+    "Other",
+  );
+console.log(`Prior carrier = "${carrierSet}"`);
 
-// 6-3 … 6-6. Policy History fields (years w/ carrier, years w/ agency,
-// lapsed days, prior BI limits) — filled + verified, see fillPolicyHistory
+// 6-2. Prior expiration: form value if it's a future date, else today + 1 yr
+const priorExpSel = (await $page.$("#priorPolicyExpirationDate"))
+  ? "#priorPolicyExpirationDate"
+  : "input.datepicker-input__input";
+let expiryMMDDYYYY = "";
+const pe = priorExpRaw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+if (
+  pe &&
+  new Date(+pe[1], +pe[2] - 1, +pe[3]) >= new Date(new Date().toDateString())
+) {
+  expiryMMDDYYYY = formatDateToMMDDYYYY(priorExpRaw);
+} else {
+  const ny = new Date();
+  ny.setFullYear(ny.getFullYear() + 1);
+  expiryMMDDYYYY = `${String(ny.getMonth() + 1).padStart(2, "0")}${String(ny.getDate()).padStart(2, "0")}${ny.getFullYear()}`;
+}
+if (!(await setDateInput($page, priorExpSel, expiryMMDDYYYY)))
+  console.warn(`Prior expiration did not stick (${expiryMMDDYYYY})`);
+
+// 6-3. Policy history
 await fillPolicyHistory($page);
 await sleep(1000);
 
-// ── 6A. Required (red) option items ──────────────────────
-// Different clients show different carriers/items, and some are already
-// checked. Detect whatever is red + unchecked and handle only those.
+// 6A. Required (red) option items
 await handleRequiredOptions($page);
+
 // ─────────────────────────────────────────────────────────────
 //  7.  PREMIUMS TAB
 // ─────────────────────────────────────────────────────────────
 
 await $page.click('.tabs__list .tabs__item a[href*="premiums"]');
 await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
-
-// Save quote
 await saveQuote($page);
 
-// Each known Review warning maps to a fix on the right tab. Add a new entry
-// here whenever a run fails with an "Unhandled review warnings" error.
+// Known Review warnings → fix. Add a new entry whenever a run fails with
+// "Unhandled review warnings".
 const REVIEW_FIXERS = [
   {
+    key: "firstLicensed",
     match: /first licensed date required/i,
     fix: async (page) => {
       if (!effectiveFirstLicenseDate) return false;
@@ -1724,12 +1897,11 @@ const REVIEW_FIXERS = [
     },
   },
   {
+    key: "vehicleZip",
     match: /zip code not set/i,
     fix: async (page) => {
-      if (!locationZip) return false;
       await goToTab(page, "vehicles");
-      await setTextInput(page, "#vehicleLocationZip", locationZip);
-      return true;
+      return ensureVehicleZip(page);
     },
   },
   {
@@ -1748,14 +1920,44 @@ const REVIEW_FIXERS = [
     fix: async (page) => {
       const dob = formatDateToMMDDYYYY(dobRaw);
       if (!dob) return false;
+      // The warning link in SinglePoint points at #driverDateOfBirth: the
+      // client DOB comes from the Insured driver. Re-select Insured and
+      // re-enter the DOB with real keystrokes so the app syncs it.
       await goToTab(page, "drivers");
-      return setClientDob(page, dob);
+      await page.waitForSelector("#driverDateOfBirth", {
+        visible: true,
+        timeout: 15000,
+      });
+      const ok = await syncInsuredDob(page);
+      // Fallback: client info form, if this SinglePoint version has a DOB there
+      if (!ok) return setClientDob(page, dob).catch(() => false);
+      return ok;
     },
   },
   {
-    // Price New / Value (and "Price ... Or Symbols") missing. With no VIN,
-    // first make sure a trim is picked (that can fill price/symbols), then
-    // fill the price field directly if it's still empty.
+    key: "gender",
+    match: /gender/i,
+    fix: async (page) => {
+      if (!genderText) return false;
+      await goToTab(page, "drivers");
+      return !!(await fillSelectVerified(page, "#driverGender", genderText));
+    },
+  },
+  {
+    key: "marital",
+    match: /marital/i,
+    fix: async (page) => {
+      await goToTab(page, "drivers");
+      return !!(
+        (await fillSelectVerified(
+          page,
+          "#driverMaritalStatus",
+          maritalText || "Single",
+        )) || (await fillSelectVerified(page, "#driverMaritalStatus", "Single"))
+      );
+    },
+  },
+  {
     key: "vehiclePrice",
     match: /price new \/ value/i,
     fix: async (page) => {
@@ -1764,16 +1966,16 @@ const REVIEW_FIXERS = [
         const trim = await page
           .$eval("#vehicleTrim", (el) => (el.value || "").trim())
           .catch(() => "");
-        if (!trim) await selectOptionPreferring(page, "#vehicleTrim", vehicleBody);
+        if (!trim)
+          await selectOptionPreferring(page, "#vehicleTrim", vehicleBody);
       }
       return ensureVehiclePrice(page);
     },
   },
   {
-    // "Required Policy History Years with Current Agency" (and any other
-    // Policy History field) → re-fill all Policy History fields on Options.
     key: "policyHistory",
-    match: /policy history|years with current agency|years with (this|prior) carrier|lapsed days|prior bodily injury/i,
+    match:
+      /policy history|years with current agency|years with (this|prior) carrier|lapsed days|prior bodily injury/i,
     fix: async (page) => {
       await goToTab(page, "options");
       await page
@@ -1783,43 +1985,43 @@ const REVIEW_FIXERS = [
     },
   },
   {
-    // These come from the vehicle having no trim selected (no VIN in the
-    // webhook) — re-pick the trim once for all of them.
     key: "vehicleTrim",
     match: /invalid vin|body style not selected|symbols are required/i,
     fix: async (page) => {
-      if (vehicleVin) return false; // a real VIN was given — don't override
+      if (vehicleVin) return false;
       await goToTab(page, "vehicles");
-      return !!(await selectOptionPreferring(page, "#vehicleTrim", vehicleBody));
+      return !!(await selectOptionPreferring(
+        page,
+        "#vehicleTrim",
+        vehicleBody,
+      ));
     },
   },
 ];
 
-// Rate All → open a plan summary: MAPFRE first, then MAIP (CAR), then any
-// other rated plan. If every plan lands on Review: resolve Arbella's
-// warnings, then rate Arbella. If after that Arbella is still in Review but
-// another plan shows "Rate", rate and use that plan instead.
 const SUMMARY_PRIORITY = ["MAPFRE", "MAIP"];
 const PREFERRED_CARRIER = "Arbella";
 const MAX_RATE_ROUNDS = 8;
-const fixedWarnings = new Set();
+const fixAttempts = new Map(); // warning → times fixed
 let summaryOpened = false;
 let summaryCarrier = null;
 let preferredResolveTried = false;
 let emptyReviewRounds = 0;
 
-// Run REVIEW_FIXERS over a list of warnings; returns the ones it couldn't fix.
+// Each warning may be fixed up to 2 times (the app sometimes needs a
+// re-save before a fixed field clears the warning).
 async function applyReviewFixers(page, warnings) {
   const unhandled = [];
-  const ranThisCall = new Map(); // fixer key → result (run shared fixers once)
+  const ranThisCall = new Map();
   for (const w of warnings) {
     const fixer = REVIEW_FIXERS.find((f) => f.match.test(w));
     if (!fixer) {
       unhandled.push(w);
       continue;
     }
-    if (fixedWarnings.has(w)) {
-      unhandled.push(`${w} (still present after fixing)`);
+    const n = fixAttempts.get(w) || 0;
+    if (n >= 2) {
+      unhandled.push(`${w} (still present after ${n} fixes)`);
       continue;
     }
     const key = fixer.key || fixer.match.source;
@@ -1833,8 +2035,9 @@ async function applyReviewFixers(page, warnings) {
       });
       ranThisCall.set(key, ok);
     }
-    if (ok) fixedWarnings.add(w);
-    else unhandled.push(`${w} (fix ran but field missing or value didn't stick)`);
+    fixAttempts.set(w, n + 1);
+    if (!ok)
+      unhandled.push(`${w} (fix ran but field missing or value didn't stick)`);
   }
   return unhandled;
 }
@@ -1843,56 +2046,38 @@ await clickRateAllPlans($page);
 console.log("Rate All Plans clicked");
 await waitForRatingSettled($page, IS_JRN ? ["MAIP"] : SUMMARY_PRIORITY);
 
-// Agent JRN: try hard to get MAIP (rate it / resolve its Review warnings).
-// If MAIP can't be rated or its warnings can't be resolved, fall through to
-// the normal flow below, which picks another plan.
 if (IS_JRN) {
   const MAIP = "MAIP";
   for (let round = 1; round <= MAX_RATE_ROUNDS; round++) {
     if (await findAndOpenPlanSummary($page, MAIP)) {
       summaryOpened = true;
       summaryCarrier = MAIP;
-      console.log("JRN: MAIP plan summary opened");
       break;
     }
-
     if (await rowButton($page, RATE_RE, { carrier: MAIP })) {
-      console.log(`JRN: rating MAIP (round ${round})`);
       await waitForRatingSettled($page, [MAIP]);
       continue;
     }
-
     const maipInReview = await rowButton($page, REVIEW_RE, {
       carrier: MAIP,
       click: false,
     });
-    if (!maipInReview) {
-      console.warn("JRN: MAIP is not ratable (no Rate/Review) — using another plan");
-      break;
-    }
-
+    if (!maipInReview) break;
     const warnings = await collectReviewWarnings($page, MAIP);
     console.log(`JRN: MAIP review warnings (round ${round}):`, warnings);
     const unhandled = warnings.length
       ? await applyReviewFixers($page, warnings)
       : ["(no warnings found)"];
-    if (unhandled.length) {
-      console.warn(
-        "JRN: can't resolve MAIP warnings — using another plan:",
-        unhandled,
-      );
-      break;
-    }
-
+    if (unhandled.length) break;
     await goToTab($page, "premiums");
     await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
-    await saveQuote($page); // persist what the fixers changed
-    await sleep(2000);
+    await saveQuote($page);
+    await clickRateAllPlans($page).catch(() => {});
+    await waitForRatingSettled($page, [MAIP]);
   }
 }
 
 for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
-  // 1. A rated plan is available → open it (MAPFRE, MAIP, then any other)
   for (const carrier of SUMMARY_PRIORITY) {
     if (await findAndOpenPlanSummary($page, carrier)) {
       summaryOpened = true;
@@ -1906,15 +2091,12 @@ for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
     break;
   }
 
-  // 2. Arbella is ready to rate → rate it
   if (await rowButton($page, RATE_RE, { carrier: PREFERRED_CARRIER })) {
     console.log(`Rating ${PREFERRED_CARRIER} (round ${round})`);
     await waitForRatingSettled($page, [PREFERRED_CARRIER]);
     continue;
   }
 
-  // 3. Arbella is stuck (still Review after resolving, or Error) and some
-  //    other plan is ready to rate → rate that one
   const preferredInReview = await rowButton($page, REVIEW_RE, {
     carrier: PREFERRED_CARRIER,
     click: false,
@@ -1923,15 +2105,12 @@ for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
     (!preferredInReview || preferredResolveTried) &&
     (await rowButton($page, RATE_RE, { excludeCarrier: PREFERRED_CARRIER }))
   ) {
-    console.log(
-      `${PREFERRED_CARRIER} not ratable — rating another plan (round ${round})`,
-    );
     await waitForRatingSettled($page);
     continue;
   }
 
-  // 4. Resolve Review warnings: Arbella's if it's in Review, else every row's
-  const reviewTarget = preferredInReview ? PREFERRED_CARRIER : null;
+  const reviewTarget =
+    preferredInReview && !preferredResolveTried ? PREFERRED_CARRIER : null;
   if (preferredInReview) preferredResolveTried = true;
   const warnings = await collectReviewWarnings($page, reviewTarget);
   console.log(
@@ -1940,13 +2119,8 @@ for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
   );
 
   if (!warnings.length) {
-    // Rating may still be running or the table may not have refreshed yet —
-    // wait, re-rate anything ratable and try again before giving up.
     emptyReviewRounds++;
     if (emptyReviewRounds <= 2) {
-      console.warn(
-        `No summary and no Review warnings (round ${round}) — waiting and re-rating`,
-      );
       await goToTab($page, "premiums");
       await $page
         .waitForSelector("table.table tbody tr", { timeout: 15000 })
@@ -1969,21 +2143,21 @@ for (let round = 1; round <= MAX_RATE_ROUNDS && !summaryOpened; round++) {
     const diag = {
       drivers: await describeTab($page, "drivers").catch((e) => e.message),
       vehicles: await describeTab($page, "vehicles").catch((e) => e.message),
-      options: await describeTab($page, "options").catch((e) => e.message),
     };
-    console.log("Page diagnostics:", JSON.stringify(diag, null, 2));
     throw new Error(
       `Unhandled review warnings — add a fixer in REVIEW_FIXERS: ${JSON.stringify(unhandled)}\n` +
-        `Quote: ${quoteUrl()}\n` +
-        `DIAGNOSTICS: ${JSON.stringify(diag)}`,
+        `Quote: ${quoteUrl()}\nDIAGNOSTICS: ${JSON.stringify(diag)}`,
     );
   }
 
-  // back to Premiums; the next round rates whatever is now ratable
+  // Persist fixes, then re-rate so fixed plans can move off "Review"
   await goToTab($page, "premiums");
   await $page.waitForSelector("table.table tbody tr", { timeout: 15000 });
-  await saveQuote($page); // persist what the fixers changed
-  await sleep(2000);
+  await saveQuote($page);
+  await clickRateAllPlans($page).catch((e) =>
+    console.warn("Re-rate failed:", e.message),
+  );
+  await waitForRatingSettled($page);
 }
 
 if (!summaryOpened) {
@@ -1998,8 +2172,6 @@ await sleep(3000);
 //  8.  CAPTURE PDF — intercept Blob created by "Print Long Proposal"
 // ─────────────────────────────────────────────────────────────
 
-// Capture PDF blobs created via URL.createObjectURL. Idempotent: safe to
-// inject more than once into the same page.
 const BLOB_HOOK = () => {
   (function () {
     if (window.__pdfQueues__) return;
@@ -2027,14 +2199,11 @@ const BLOB_HOOK = () => {
   })();
 };
 
-// Install for future navigations AND in the page that's already open (the
-// app is a single-page app, so evaluateOnNewDocument alone never runs).
 if ($page.evaluateOnNewDocument) {
   await $page.evaluateOnNewDocument(BLOB_HOOK).catch(() => {});
 }
 await $page.evaluate(BLOB_HOOK).catch(() => {});
 
-// Pull captured PDF bytes from a page
 async function pullFrom(pg) {
   try {
     const arrays = await pg.evaluate(() =>
@@ -2047,7 +2216,6 @@ async function pullFrom(pg) {
   }
 }
 
-// Make sure the plan summary is open with its print launcher visible.
 async function ensurePrintLauncher() {
   const visible = () =>
     $page
@@ -2070,17 +2238,13 @@ async function ensurePrintLauncher() {
     throw new Error("Plan summary opened but print launcher never appeared");
 }
 
-// Open the print tooltip menu. The launcher TOGGLES the menu, so only click
-// it when the "Print Long Proposal" link isn't already in the DOM (a blind
-// re-click would close a menu that's already open). Checks for existence,
-// not visibility — the menu animates in and can read as "not visible".
 async function openPrintMenu() {
   const hasProposalLink = () =>
     $page
       .evaluate(() =>
-        Array.from(document.querySelectorAll(".tooltip__menu a, .tooltip__menu-link")).some(
-          (a) => /Print\s*Long\s*Proposal/i.test(a.textContent || ""),
-        ),
+        Array.from(
+          document.querySelectorAll(".tooltip__menu a, .tooltip__menu-link"),
+        ).some((a) => /Print\s*Long\s*Proposal/i.test(a.textContent || "")),
       )
       .catch(() => false);
 
@@ -2092,17 +2256,17 @@ async function openPrintMenu() {
         el.click();
       });
     } else {
-      // real mouse click as a fallback (some tooltips ignore el.click())
       const h = await $page.$("#tooltipLauncherPrint");
       const box = h && (await h.boundingBox());
-      if (box) await $page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      if (box)
+        await $page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
     }
     const appeared = await $page
       .waitForFunction(
         () =>
-          Array.from(document.querySelectorAll(".tooltip__menu a, .tooltip__menu-link")).some(
-            (a) => /Print\s*Long\s*Proposal/i.test(a.textContent || ""),
-          ),
+          Array.from(
+            document.querySelectorAll(".tooltip__menu a, .tooltip__menu-link"),
+          ).some((a) => /Print\s*Long\s*Proposal/i.test(a.textContent || "")),
         { timeout: 6000 },
       )
       .then(() => true)
@@ -2113,8 +2277,6 @@ async function openPrintMenu() {
   throw new Error("Print menu (Print Long Proposal) never opened");
 }
 
-// One full attempt: open print menu → Print Long Proposal → collect the PDF
-// from blob hooks (main tab + popup) or from network responses.
 async function capturePdfOnce() {
   await ensurePrintLauncher();
   await $page.evaluate(BLOB_HOOK).catch(() => {});
@@ -2124,14 +2286,17 @@ async function capturePdfOnce() {
     })
     .catch(() => {});
 
-  // Network sniffer must be listening BEFORE the click
   const sniffed = [];
   const sniff = async (resp) => {
     try {
       const headers = resp.headers() || {};
       const ct = (headers["content-type"] || "").toLowerCase();
       const cd = (headers["content-disposition"] || "").toLowerCase();
-      if (!ct.includes("pdf") && !cd.includes(".pdf") && !ct.includes("octet-stream"))
+      if (
+        !ct.includes("pdf") &&
+        !cd.includes(".pdf") &&
+        !ct.includes("octet-stream")
+      )
         return;
       const buf = await (resp.buffer
         ? resp.buffer()
@@ -2155,21 +2320,22 @@ async function capturePdfOnce() {
 
   try {
     await openPrintMenu();
-
     const clickedProposal = await $page.evaluate(() => {
       const target = Array.from(
         document.querySelectorAll(".tooltip__menu a, .tooltip__menu-link"),
       ).find((a) =>
-        /Print\s*Long\s*Proposal/i.test((a.innerText || a.textContent || "").trim()),
+        /Print\s*Long\s*Proposal/i.test(
+          (a.innerText || a.textContent || "").trim(),
+        ),
       );
       if (!target) return false;
       target.scrollIntoView({ block: "center" });
       target.click();
       return true;
     });
-    if (!clickedProposal) throw new Error('Could not find "Print Long Proposal"');
+    if (!clickedProposal)
+      throw new Error('Could not find "Print Long Proposal"');
 
-    // Poll up to ~30s for the PDF to show up anywhere
     let bufs = [];
     for (let waited = 0; waited < 30000 && !bufs.length; waited += 1000) {
       await sleep(1000);
@@ -2210,26 +2376,35 @@ const fileDate = [
   String(now.getDate()).padStart(2, "0"),
   now.getFullYear(),
 ].join("");
-
 const fileName = `${fileDate} ${firstName} ${lastName} auto insurance quote.pdf`;
 
 // ─────────────────────────────────────────────────────────────
 //  9.  RETURN RESULT
 // ─────────────────────────────────────────────────────────────
 
+const vehicleCount = Number(B.vehicle_count || 1);
+const addlDrivers = Number(B.addl_driver_count || 0);
+
 return [
   {
     json: {
       message: "PDF captured successfully",
-      email: email,
-      licenseNo: licenseNo,
-      fileName: fileName,
+      email,
+      licenseNo,
+      fileName,
+      quoteUrl: quoteUrl(),
+      carrier: summaryCarrier || "first rated plan",
+      flow: isRmvFlow ? "rmv" : "manual",
+      notQuoted: {
+        extraVehicles: Math.max(0, vehicleCount - 1),
+        additionalDrivers: addlDrivers,
+      },
     },
     binary: {
       proposal: {
         data: pdfBuffer.toString("base64"),
         mimeType: "application/pdf",
-        fileName: fileName,
+        fileName,
       },
     },
   },
